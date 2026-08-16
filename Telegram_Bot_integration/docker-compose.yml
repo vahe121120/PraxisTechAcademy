@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: praxis_app
+      POSTGRES_PASSWORD: praxis_dev_only
+      POSTGRES_DB: praxis
+    ports:
+      - '5432:5432'
+    volumes:
+      - praxis_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U praxis_app -d praxis']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  praxis_postgres_data:
