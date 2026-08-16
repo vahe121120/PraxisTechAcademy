@@ -1,0 +1,76 @@
+@import "tailwindcss";
+
+@theme {
+  /* Ink / neutrals — cool, near-black, not pure gray */
+  --color-ink-950: #0a0d16;
+  --color-ink-900: #12162399;
+  --color-ink-900-solid: #121623;
+  --color-ink-800: #1c2233;
+  --color-ink-700: #2a3247;
+  --color-ink-500: #5b6478;
+  --color-ink-300: #a3aabc;
+  --color-ink-100: #e7e9f0;
+  --color-ink-50: #f6f7fa;
+
+  /* Brand — electric indigo, the "signal" color of the product */
+  --color-brand-50: #eef0ff;
+  --color-brand-100: #dfe2ff;
+  --color-brand-300: #a6acff;
+  --color-brand-500: #5b5fef;
+  --color-brand-600: #4640e0;
+  --color-brand-700: #3730b3;
+  --color-brand-900: #221f6e;
+
+  /* Signal — cyan accent used sparingly for emphasis/data */
+  --color-signal-400: #4fd6dd;
+  --color-signal-500: #22c3cc;
+
+  /* Danger */
+  --color-danger-50: #fef2f2;
+  --color-danger-100: #fee2e2;
+  --color-danger-500: #dc2626;
+  --color-danger-600: #b91c1c;
+
+  /* Success */
+  --color-success-50: #ecfdf5;
+  --color-success-500: #16a34a;
+
+  /* Warning */
+  --color-warning-50: #fffbeb;
+  --color-warning-500: #d97706;
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", monospace;
+
+  --radius-card: 0.875rem;
+}
+
+body {
+  background-color: var(--color-ink-50);
+  color: var(--color-ink-900-solid);
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background-color: var(--color-ink-950);
+    color: var(--color-ink-100);
+  }
+}
+
+/* Visible keyboard focus everywhere — never suppressed */
+:focus-visible {
+  outline: 2px solid var(--color-brand-500);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
