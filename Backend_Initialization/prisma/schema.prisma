@@ -1,0 +1,645 @@
+// =============================================================================
+// Praxis Tech Academy — Database Schema
+// PostgreSQL + Prisma
+//
+// Design principles enforced throughout this file:
+//   - Money is stored as integer minor units (never float) to avoid rounding drift.
+//   - Every mutable state field is a Postgres enum, not free text.
+//   - Financial/audit-relevant rows are never hard-deleted or cascade-deleted;
+//     FKs from money/attendance/audit tables use onDelete: Restrict.
+//   - Ephemeral security artifacts (refresh tokens, link tokens) use onDelete:
+//     Cascade, since they carry no historical/business value once the parent
+//     User row governs their lifecycle.
+//   - snake_case at the database level (@@map / @map) with camelCase in the
+//     Prisma Client, per Postgres/Node convention split.
+//   - CHECK constraints that Prisma's schema language cannot express natively
+//     (e.g. amount > 0, period_end > period_start) are shipped as a raw SQL
+//     migration addendum — see constraints.sql in this same directory and the
+//     accompanying explanation in the chat response.
+// =============================================================================
+
+// Pinned to the `prisma-client-js` generator (Prisma 6.x line) rather than
+// the newer `prisma-client` generator (Prisma 7+), which requires the whole
+// package to run as an ES module and mandates a driver adapter
+// (@prisma/adapter-pg) for every connection. That's a cross-cutting change
+// to the entire NestJS app (module system, ts-jest/ts-node config, decorator
+// metadata emission) that isn't justified for this project yet. Revisit
+// when the NestJS + ESM + Prisma driver-adapter tooling has matured further.
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Separate direct (non-pooled) connection for migrations when running
+  // behind PgBouncer/Supabase pooler/RDS Proxy in production.
+  directUrl = env("DIRECT_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum UserRole {
+  STUDENT
+  TEACHER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED // soft delete only — row is retained for financial/audit history
+}
+
+enum Locale {
+  EN
+  RU
+  HY
+}
+
+enum CourseTrack {
+  FUNDAMENTALS // Python, JavaScript, C/C++
+  PROFESSION // Manual QA, QA Automation
+  COMBINED
+  MINI // free/lead-magnet mini courses
+}
+
+enum Currency {
+  AMD
+  USD
+}
+
+enum CourseStatus {
+  DRAFT // being built, not yet visible to students
+  PUBLISHED // the only status visible to public/student-facing endpoints
+  ARCHIVED // retired; historical Cohorts still reference it, kept for record integrity
+}
+
+enum CohortStatus {
+  UPCOMING
+  ACTIVE
+  COMPLETED
+  CANCELLED
+}
+
+enum EnrollmentStatus {
+  PENDING_PAYMENT
+  ACTIVE
+  SUSPENDED
+  COMPLETED
+  CANCELLED
+}
+
+enum SubscriptionStatus {
+  PENDING // enrollment created, first payment not yet completed
+  ACTIVE
+  PAST_DUE // period ended, inside grace window
+  EXPIRED // grace window passed, access revoked
+  CANCELLED // voluntary cancel; access persists until currentPeriodEnd
+}
+
+enum OrderStatus {
+  CREATED // internal record created, not yet sent to gateway
+  PENDING // sent to ARCA, awaiting student to complete payment
+  SUCCEEDED
+  FAILED
+  CANCELLED // student abandoned / order expired unpaid
+  EXPIRED
+}
+
+enum PaymentStatus {
+  INITIATED // registered with gateway, awaiting redirect completion
+  PENDING // gateway reports processing (e.g. 3-D Secure in progress)
+  SUCCEEDED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentProviderType {
+  ARCA
+}
+
+enum TelegramGrantStatus {
+  ISSUED // single-use invite link generated, not yet consumed
+  JOINED // student joined the group using the link
+  REVOKED // access removed (expiry, cancellation, admin action)
+  EXPIRED // invite link expired unused
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+}
+
+enum NotificationChannel {
+  EMAIL
+  TELEGRAM_DM
+  TELEGRAM_GROUP
+}
+
+enum NotificationType {
+  WELCOME
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  PAYMENT_SUCCEEDED
+  PAYMENT_FAILED
+  RENEWAL_REMINDER_7D
+  RENEWAL_REMINDER_1D
+  SUBSCRIPTION_PAST_DUE
+  ACCESS_GRANTED
+  ACCESS_REVOKED
+  TELEGRAM_LINK_REQUEST
+  ATTENDANCE_REMINDER
+  ADMIN_MANUAL_MESSAGE
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+}
+
+// =============================================================================
+// USERS & AUTH
+// =============================================================================
+
+/// A single table for students, teachers, and admins, discriminated by `role`.
+/// A separate table per role was considered and rejected: auth, refresh
+/// tokens, and Telegram linking are identical across roles, and a unified
+/// table is what lets `RolesGuard` and FK relations (e.g. Attendance.markedBy)
+/// stay simple instead of juggling three parallel identity tables.
+model User {
+  id              String     @id @default(uuid()) @db.Uuid
+  // Normalized to lowercase at the application layer before every write;
+  // enforced here as a plain unique index rather than a citext extension so
+  // the schema has no dependency on the hosting provider allowing extensions.
+  email           String     @unique @db.VarChar(255)
+  passwordHash    String     @map("password_hash") @db.VarChar(255)
+  role            UserRole   @default(STUDENT)
+  status          UserStatus @default(ACTIVE)
+  name            String     @db.VarChar(150)
+  phone           String?    @db.VarChar(32)
+  // Self-reported at registration/profile-update time, purely a contact
+  // convenience field — NOT the verified Telegram identity. The verified,
+  // uniquely-bound identity used for actually granting group access lives
+  // on `TelegramLink.telegramUserId`, captured from the real Telegram Bot
+  // API during the `/start <token>` deep-link flow. A student can type
+  // anything here (including someone else's handle, or a typo), so it must
+  // never be trusted for access-control decisions — only for admins/support
+  // to know who to look for before linking is complete.
+  telegramUsername String?   @map("telegram_username") @db.VarChar(64)
+  locale          Locale     @default(HY)
+  emailVerifiedAt DateTime?  @map("email_verified_at")
+  createdAt       DateTime   @default(now()) @map("created_at")
+  updatedAt       DateTime   @updatedAt @map("updated_at")
+
+  refreshTokens      RefreshToken[]
+  telegramLink        TelegramLink?
+  telegramLinkTokens  TelegramLinkToken[]
+  enrollments          Enrollment[]
+  orders                Order[]
+  telegramAccessGrants  TelegramAccessGrant[]
+  notifications         NotificationLog[]
+  sessionsCreated       Session[]             @relation("SessionCreatedBy")
+  attendanceMarkedBy    Attendance[]          @relation("AttendanceMarkedBy")
+  auditLogEntries       AuditLog[]            @relation("AuditActor")
+
+  @@index([role])
+  @@index([status])
+  @@map("users")
+}
+
+/// Refresh tokens are stored hashed (SHA-256, not bcrypt — see auth module
+/// notes on why a slow password hash is the wrong tool for a high-entropy
+/// token) so a leaked database backup cannot be used to mint live sessions.
+/// `familyId` is shared across every token produced by rotating a single
+/// login session: if a token is presented after it's already been rotated
+/// away, that's evidence of reuse/theft, and the whole family is revoked at
+/// once rather than just the one token.
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  familyId  String    @map("family_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash") @db.VarChar(255)
+  userAgent String?   @map("user_agent") @db.VarChar(255)
+  ipAddress String?   @map("ip_address") @db.VarChar(45) // IPv6-safe length
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([familyId])
+  @@map("refresh_tokens")
+}
+
+/// One row per User once linked. Both sides are unique: this is what
+/// prevents one Telegram account from being reused to share access across
+/// two separately paying platform accounts.
+model TelegramLink {
+  id               String   @id @default(uuid()) @db.Uuid
+  userId           String   @unique @map("user_id") @db.Uuid
+  telegramUserId   BigInt   @unique @map("telegram_user_id")
+  telegramUsername String?  @map("telegram_username") @db.VarChar(64) // display only, not stable
+  linkedAt         DateTime @default(now()) @map("linked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("telegram_links")
+}
+
+/// Short-lived, single-use token behind the `/start <token>` deep-link flow
+/// used to associate a Telegram account with a platform account. Ephemeral
+/// by design — cascades with the user.
+model TelegramLinkToken {
+  id          String    @id @default(uuid()) @db.Uuid
+  userId      String    @map("user_id") @db.Uuid
+  token       String    @unique @db.VarChar(64)
+  expiresAt   DateTime  @map("expires_at")
+  consumedAt  DateTime? @map("consumed_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("telegram_link_tokens")
+}
+
+// =============================================================================
+// COURSES & COHORTS
+// =============================================================================
+
+/// The catalog product: "Python", "JavaScript", "C/C++", "Manual QA",
+/// "QA Automation". Price lives here as the default/current price; each
+/// Order snapshots its own amount so historical invoices are never altered
+/// retroactively by a later price change.
+/// Catalog product: Python, JavaScript, C/C++, Manual QA, QA Automation.
+/// `status` gates public visibility — only PUBLISHED courses are ever
+/// returned to unauthenticated/student-facing endpoints; DRAFT lets an
+/// admin build out a course before it's announced, ARCHIVED retires one
+/// without deleting the historical record every past Cohort still points to.
+model Course {
+  id            String        @id @default(uuid()) @db.Uuid
+  slug          String        @unique @db.VarChar(120)
+  title         String        @db.VarChar(150)
+  description   String
+  track         CourseTrack
+  // Integer minor units (e.g. luma/cents), matching the money convention
+  // used everywhere else in this schema — never a float.
+  monthlyPrice  Int           @map("monthly_price")
+  currency      Currency      @default(AMD)
+  // Total course length in days — matches how Praxis's existing course
+  // presentations are actually described ("10-day", "15-day" intensives)
+  // rather than an assumed week/month unit.
+  durationDays  Int           @map("duration_days")
+  status        CourseStatus  @default(DRAFT)
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+
+  cohorts Cohort[]
+
+  @@index([track])
+  @@index([status])
+  @@map("courses")
+}
+
+/// A "Course Group" — a scheduled live run of a course, e.g. "QA Automation
+/// September 2026". This is what students actually enroll in, not the
+/// Course itself, because price, dates, and the Telegram group are all
+/// specific to a single run, not the course as an abstract catalog entry.
+model Cohort {
+  id        String       @id @default(uuid()) @db.Uuid
+  courseId  String       @map("course_id") @db.Uuid
+  title     String       @db.VarChar(150) // e.g. "QA Automation September 2026"
+  startDate DateTime     @map("start_date") @db.Date
+  endDate   DateTime?    @map("end_date") @db.Date
+  capacity  Int?
+  status    CohortStatus @default(UPCOMING)
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+
+  course        Course         @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  telegramGroup TelegramGroup?
+  enrollments   Enrollment[]
+  sessions      Session[]
+
+  @@index([courseId])
+  @@index([status])
+  @@index([startDate])
+  @@map("cohorts")
+}
+
+// =============================================================================
+// TELEGRAM
+// =============================================================================
+
+/// The private Telegram group tied 1:1 to a Cohort. `inviteLink` here is a
+/// fallback/reference link (e.g. for admin visibility); day-to-day student
+/// access goes through TelegramAccessGrant's single-use, per-student links,
+/// never this shared one, so a forwarded link can't leak paid access.
+model TelegramGroup {
+  id             String   @id @default(uuid()) @db.Uuid
+  cohortId       String   @unique @map("cohort_id") @db.Uuid
+  telegramChatId BigInt   @unique @map("telegram_chat_id")
+  title          String   @db.VarChar(150)
+  inviteLink     String?  @map("invite_link") @db.VarChar(255)
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  cohort               Cohort                @relation(fields: [cohortId], references: [id], onDelete: Restrict)
+  telegramAccessGrants TelegramAccessGrant[]
+
+  @@map("telegram_groups")
+}
+
+/// Audit trail of every invite issued to a student: one row per grant
+/// attempt. Single-use (`member_limit: 1`, short expiry) invite links are
+/// generated per grant rather than reusing one group-wide link — this is
+/// what makes per-student revocation and access-sharing prevention possible.
+model TelegramAccessGrant {
+  id              String               @id @default(uuid()) @db.Uuid
+  userId          String               @map("user_id") @db.Uuid
+  telegramGroupId String               @map("telegram_group_id") @db.Uuid
+  inviteLink      String?              @map("invite_link") @db.VarChar(255)
+  status          TelegramGrantStatus  @default(ISSUED)
+  issuedAt        DateTime             @default(now()) @map("issued_at")
+  linkExpiresAt   DateTime?            @map("link_expires_at")
+  joinedAt        DateTime?            @map("joined_at")
+  revokedAt       DateTime?            @map("revoked_at")
+  revokedReason   String?              @map("revoked_reason") @db.VarChar(255)
+
+  user          User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  telegramGroup TelegramGroup @relation(fields: [telegramGroupId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@index([telegramGroupId])
+  @@index([status])
+  @@map("telegram_access_grants")
+}
+
+// =============================================================================
+// ENROLLMENTS & SUBSCRIPTIONS
+// =============================================================================
+
+/// The student ↔ cohort relationship. Deliberately separate from
+/// Subscription: Enrollment answers "is this student part of this cohort at
+/// all" (including states like COMPLETED that have nothing to do with
+/// billing), while Subscription answers "is this student's billing current."
+model Enrollment {
+  id          String           @id @default(uuid()) @db.Uuid
+  userId      String           @map("user_id") @db.Uuid
+  cohortId    String           @map("cohort_id") @db.Uuid
+  status      EnrollmentStatus @default(PENDING_PAYMENT)
+  enrolledAt  DateTime         @default(now()) @map("enrolled_at")
+  completedAt DateTime?        @map("completed_at")
+  cancelledAt DateTime?        @map("cancelled_at")
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  cohort       Cohort        @relation(fields: [cohortId], references: [id], onDelete: Restrict)
+  subscription Subscription?
+  attendance   Attendance[]
+
+  // A student cannot enroll twice in the same cohort.
+  @@unique([userId, cohortId])
+  @@index([cohortId])
+  @@index([status])
+  @@map("enrollments")
+}
+
+/// The monthly billing state machine. One row per Enrollment. This table is
+/// the single source of truth the scheduler scans nightly (see
+/// `[status, nextBillingDate]` composite index below) and the single source
+/// of truth TelegramAccessService consults before granting or revoking
+/// access — payments and Telegram automation both react to *this* table
+/// changing state, rather than reacting to each other directly.
+model Subscription {
+  id                  String             @id @default(uuid()) @db.Uuid
+  enrollmentId        String             @unique @map("enrollment_id") @db.Uuid
+  status              SubscriptionStatus @default(PENDING)
+  currentPeriodStart  DateTime?          @map("current_period_start")
+  currentPeriodEnd    DateTime?          @map("current_period_end")
+  nextBillingDate     DateTime?          @map("next_billing_date")
+  gracePeriodEndsAt   DateTime?          @map("grace_period_ends_at")
+  autoRenew           Boolean            @default(false) @map("auto_renew") // true only if the bank's ARCA integration supports card binding
+  cancelledAt         DateTime?          @map("cancelled_at")
+  createdAt           DateTime           @default(now()) @map("created_at")
+  updatedAt           DateTime           @updatedAt @map("updated_at")
+
+  enrollment Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Restrict)
+  orders     Order[]
+
+  // This composite index is exactly what SubscriptionSweepScheduler scans
+  // every morning: "give me everything ACTIVE/PAST_DUE whose billing date
+  // or grace window falls due" without a sequential scan over the table.
+  @@index([status, nextBillingDate])
+  @@index([status, gracePeriodEndsAt])
+  @@map("subscriptions")
+}
+
+// =============================================================================
+// ORDERS & PAYMENTS
+// =============================================================================
+
+/// A payment *request* — the internal business object created the moment a
+/// student clicks "Pay," before any gateway is involved. Separated from
+/// Payment because one Order can have multiple Payment attempts (e.g. a
+/// failed 3-D Secure challenge followed by a retry with a different card),
+/// and because Order carries the business context (which subscription,
+/// which billing period, snapshotted price) that the gateway doesn't need
+/// to know about.
+model Order {
+  id             String      @id @default(uuid()) @db.Uuid
+  orderNumber    String      @unique @map("order_number") @db.VarChar(64) // merchant order ref sent to ARCA
+  userId         String      @map("user_id") @db.Uuid
+  subscriptionId String      @map("subscription_id") @db.Uuid
+  amount         Int // integer minor units, snapshotted at order creation time
+  currency       Currency
+  status         OrderStatus @default(CREATED)
+  periodStart    DateTime    @map("period_start") @db.Date
+  periodEnd      DateTime    @map("period_end") @db.Date
+  description    String?     @db.VarChar(255)
+  createdAt      DateTime    @default(now()) @map("created_at")
+  expiresAt      DateTime?   @map("expires_at") // unpaid orders auto-expire (e.g. 30 min)
+  cancelledAt    DateTime?   @map("cancelled_at")
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Restrict)
+  subscription Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Restrict)
+  payments     Payment[]
+
+  @@index([userId])
+  @@index([subscriptionId])
+  @@index([status])
+  @@map("orders")
+}
+
+/// A single gateway-side transaction attempt against an Order. Mirrors the
+/// fields a real ARCA-family bank gateway returns (approval code, RRN, last
+/// four digits + brand — never a full PAN or CVV, which never touch this
+/// system since checkout happens on ARCA's hosted page). `providerOrderId`
+/// is the idempotency key: ARCA's server-to-server callback is looked up by
+/// this field and processing is a no-op if it's already terminal.
+model Payment {
+  id                 String              @id @default(uuid()) @db.Uuid
+  orderId            String              @map("order_id") @db.Uuid
+  provider           PaymentProviderType @default(ARCA)
+  providerOrderId    String              @unique @map("provider_order_id") @db.VarChar(128)
+  status             PaymentStatus       @default(INITIATED)
+  attemptNumber      Int                 @default(1) @map("attempt_number")
+  approvalCode       String?             @map("approval_code") @db.VarChar(32)
+  rrn                String?             @map("rrn") @db.VarChar(32) // Retrieval Reference Number
+  cardMask           String?             @map("card_mask") @db.VarChar(19) // e.g. "4** **** **** 1234"
+  cardBrand          String?             @map("card_brand") @db.VarChar(32)
+  rawGatewayResponse Json?               @map("raw_gateway_response")
+  failureCode        String?             @map("failure_code") @db.VarChar(64)
+  failureMessage     String?             @map("failure_message") @db.VarChar(500)
+  initiatedAt        DateTime            @default(now()) @map("initiated_at")
+  completedAt        DateTime?           @map("completed_at")
+
+  order          Order                @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  webhookEvents  PaymentWebhookEvent[]
+
+  @@index([orderId])
+  @@index([status])
+  @@map("payments")
+}
+
+/// Append-only inbox for every inbound gateway webhook, persisted *before*
+/// signature verification or business logic runs. This is what makes a bad
+/// or dropped callback recoverable — a malformed or rejected event is never
+/// silently lost, it's a row you can inspect and replay.
+model PaymentWebhookEvent {
+  id              String    @id @default(uuid()) @db.Uuid
+  paymentId       String?   @map("payment_id") @db.Uuid // nullable: may arrive before Payment is resolvable
+  provider        PaymentProviderType @default(ARCA)
+  payload         Json
+  signature       String?   @db.VarChar(512)
+  signatureValid  Boolean   @map("signature_valid")
+  receivedAt      DateTime  @default(now()) @map("received_at")
+  processedAt     DateTime? @map("processed_at")
+  processingError String?   @map("processing_error") @db.VarChar(1000)
+
+  payment Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@index([provider])
+  @@index([processedAt])
+  @@index([paymentId])
+  @@map("payment_webhook_events")
+}
+
+// =============================================================================
+// LESSONS & ATTENDANCE
+// =============================================================================
+
+/// A single scheduled live lesson occurrence within a Cohort (Zoom/Google
+/// Meet). This table isn't in the original entity list but is a structural
+/// necessity: Attendance means nothing without a specific lesson it's
+/// attendance *for*. Kept intentionally lightweight — this is not a content
+/// management system, just enough to anchor attendance and reminders.
+model Session {
+  id            String   @id @default(uuid()) @db.Uuid
+  cohortId      String   @map("cohort_id") @db.Uuid
+  title         String   @db.VarChar(150)
+  scheduledAt   DateTime @map("scheduled_at")
+  durationMin   Int      @default(90) @map("duration_min")
+  meetingUrl    String?  @map("meeting_url") @db.VarChar(500)
+  createdById   String?  @map("created_by_id") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  cohort    Cohort       @relation(fields: [cohortId], references: [id], onDelete: Restrict)
+  createdBy User?        @relation("SessionCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  attendance Attendance[]
+
+  @@index([cohortId])
+  @@index([scheduledAt])
+  @@map("sessions")
+}
+
+/// Lesson attendance per student per session. Unique on
+/// (enrollmentId, sessionId) — a student has exactly one attendance record
+/// per lesson, updatable (e.g. LATE corrected to PRESENT) rather than
+/// duplicated.
+model Attendance {
+  id              String            @id @default(uuid()) @db.Uuid
+  enrollmentId    String            @map("enrollment_id") @db.Uuid
+  sessionId       String            @map("session_id") @db.Uuid
+  status          AttendanceStatus
+  joinedAt        DateTime?         @map("joined_at")
+  leftAt          DateTime?         @map("left_at")
+  durationMinutes Int?              @map("duration_minutes")
+  markedById      String?           @map("marked_by_id") @db.Uuid // null = auto-tracked, set = manual override
+  notes           String?           @db.VarChar(500)
+  createdAt       DateTime          @default(now()) @map("created_at")
+  updatedAt       DateTime          @updatedAt @map("updated_at")
+
+  enrollment Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Restrict)
+  session    Session    @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  markedBy   User?      @relation("AttendanceMarkedBy", fields: [markedById], references: [id], onDelete: SetNull)
+
+  @@unique([enrollmentId, sessionId])
+  @@index([sessionId])
+  @@index([status])
+  @@map("attendance")
+}
+
+// =============================================================================
+// NOTIFICATIONS
+// =============================================================================
+
+/// History of every message sent to a student (email or Telegram DM). Two
+/// jobs: (1) auditability — "did we actually email this student," and
+/// (2) dedupe guard — the scheduler checks this table before sending
+/// RENEWAL_REMINDER_7D twice for the same subscription period.
+model NotificationLog {
+  id        String              @id @default(uuid()) @db.Uuid
+  userId    String              @map("user_id") @db.Uuid
+  channel   NotificationChannel
+  type      NotificationType
+  status    NotificationStatus  @default(PENDING)
+  subject   String?             @db.VarChar(255)
+  metadata  Json? // e.g. { subscriptionId, periodEnd } — used for dedupe queries
+  sentAt    DateTime?           @map("sent_at")
+  failedReason String?          @map("failed_reason") @db.VarChar(500)
+  createdAt DateTime            @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([userId])
+  @@index([type])
+  // Powers the dedupe check: "has this user already received this
+  // notification type recently."
+  @@index([userId, type, createdAt])
+  @@map("notification_logs")
+}
+
+// =============================================================================
+// AUDIT LOG
+// =============================================================================
+
+/// Generic append-only audit trail for every state change that matters for
+/// dispute resolution or compliance: subscription transitions, manual admin
+/// overrides, refunds, access grants/revokes. `actorUserId` is nullable
+/// because most rows are written by the scheduler/system, not a human.
+model AuditLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  actorUserId  String?  @map("actor_user_id") @db.Uuid
+  action       String   @db.VarChar(100)
+  entityType   String   @map("entity_type") @db.VarChar(100)
+  entityId     String   @map("entity_id") @db.Uuid
+  before       Json?
+  after        Json?
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  actor User? @relation("AuditActor", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([entityType, entityId])
+  @@index([actorUserId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
