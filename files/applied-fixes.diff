@@ -1,0 +1,140 @@
+diff --git a/Admin_Panel_Backend/src/auth/strategies/jwt-refresh.strategy.ts b/Admin_Panel_Backend/src/auth/strategies/jwt-refresh.strategy.ts
+index 71a5dfd..644ffc6 100644
+--- a/Admin_Panel_Backend/src/auth/strategies/jwt-refresh.strategy.ts
++++ b/Admin_Panel_Backend/src/auth/strategies/jwt-refresh.strategy.ts
+@@ -19,6 +19,9 @@ export class JwtRefreshStrategy extends PassportStrategy(Strategy, 'jwt-refresh'
+       jwtFromRequest: (req: Request) => extractRefreshToken(req),
+       ignoreExpiration: false,
+       secretOrKey: config.jwtRefreshSecret,
++      // See JwtStrategy for why this is pinned explicitly rather than left
++      // to jsonwebtoken's default inference.
++      algorithms: ['HS256'],
+       passReqToCallback: true,
+     });
+   }
+diff --git a/Admin_Panel_Backend/src/auth/strategies/jwt.strategy.ts b/Admin_Panel_Backend/src/auth/strategies/jwt.strategy.ts
+index 2435df2..6fa6d46 100644
+--- a/Admin_Panel_Backend/src/auth/strategies/jwt.strategy.ts
++++ b/Admin_Panel_Backend/src/auth/strategies/jwt.strategy.ts
+@@ -17,6 +17,10 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
+       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+       ignoreExpiration: false,
+       secretOrKey: config.jwtAccessSecret,
++      // Explicit allowlist rather than relying on jsonwebtoken's key-type
++      // inference to reject other algorithms — this secret is HMAC-only,
++      // and an access token should never verify under anything else.
++      algorithms: ['HS256'],
+     });
+   }
+ 
+diff --git a/Admin_Panel_Backend/src/payments/payments.service.ts b/Admin_Panel_Backend/src/payments/payments.service.ts
+index d85e00a..60b58e2 100644
+--- a/Admin_Panel_Backend/src/payments/payments.service.ts
++++ b/Admin_Panel_Backend/src/payments/payments.service.ts
+@@ -245,13 +245,37 @@ export class PaymentsService {
+       return;
+     }
+ 
+-    if (result.status === 'SUCCEEDED') {
+-      await this.applySuccessfulPayment(payment.id, result, webhookEvent.id);
+-    } else if (result.status === 'FAILED') {
+-      await this.applyFailedPayment(payment.id, result);
++    // Wrapped the same way the verifyPayment() call above already is: this
++    // dispatch does real writes (Payment/Order/Subscription state, plus an
++    // external Telegram call) and must not be allowed to turn into an
++    // uncaught exception that reaches the controller as a non-200 — that
++    // breaks this webhook's own documented "always 200" contract and, on
++    // some ARCA-family bank implementations, risks the merchant's webhook
++    // being disabled after repeated non-2xx responses, which would silently
++    // stop *all* future payment confirmations, not just this one. The
++    // atomic claim inside applySuccessfulPayment (see its doc comment)
++    // closes the race that used to make this reachable; this catch is the
++    // second, independent layer — for that race and for anything else
++    // unanticipated.
++    try {
++      if (result.status === 'SUCCEEDED') {
++        await this.applySuccessfulPayment(payment.id, result, webhookEvent.id);
++      } else if (result.status === 'FAILED') {
++        await this.applyFailedPayment(payment.id, result);
++      }
++      // PENDING/UNKNOWN: nothing to apply yet — a later callback or the
++      // reconciliation sweep resolves it.
++    } catch (error) {
++      this.logger.error(
++        `Failed to apply webhook result for payment ${payment.id} (event ${webhookEvent.id})`,
++        error instanceof Error ? error.stack : String(error),
++      );
++      await this.markWebhookError(
++        webhookEvent.id,
++        `Failed to apply result: ${error instanceof Error ? error.message : String(error)}`,
++      );
++      return;
+     }
+-    // PENDING/UNKNOWN: nothing to apply yet — a later callback or the
+-    // reconciliation sweep resolves it.
+ 
+     await this.markWebhookProcessed(webhookEvent.id);
+   }
+@@ -354,9 +378,25 @@ export class PaymentsService {
+ 
+     // Step 1: confirm payment. Step 2: create subscription — both inside
+     // the transaction below.
++    //
++    // SECURITY: the TERMINAL_PAYMENT_STATUSES check in handleWebhook() is a
++    // plain read, not a lock — two concurrent deliveries of the same
++    // callback (normal for a payment gateway's retry behavior, and not
++    // something an attacker needs to trigger deliberately) can both read
++    // the payment as non-terminal and both reach this method before either
++    // one's transaction commits. The `updateMany` below is the actual
++    // concurrency guard: it makes "claim this payment for processing"
++    // atomic by folding the check into the write's WHERE clause, so the
++    // database — not two racing reads in application code — decides which
++    // execution wins. The loser's `count` comes back 0 and it returns
++    // immediately, before creating a second Subscription for the same
++    // (unique) Enrollment and throwing an uncaught P2002 that would
++    // otherwise surface as a non-200 response to ARCA (see the try/catch
++    // now wrapping this dispatch in handleWebhook, added as a second,
++    // independent layer of protection for that same contract).
+     const subscriptionId = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+-      await tx.payment.update({
+-        where: { id: paymentId },
++      const claim = await tx.payment.updateMany({
++        where: { id: paymentId, status: { notIn: TERMINAL_PAYMENT_STATUSES } },
+         data: {
+           status: PaymentStatus.SUCCEEDED,
+           approvalCode: result.approvalCode,
+@@ -368,6 +408,14 @@ export class PaymentsService {
+         },
+       });
+ 
++      if (claim.count === 0) {
++        // Lost the race (or this is a genuine duplicate delivery) — a
++        // concurrent/earlier call already claimed and is processing (or
++        // has already processed) this payment. Nothing left to do here;
++        // returning null short-circuits Steps 2 onward.
++        return null;
++      }
++
+       await tx.order.update({ where: { id: order.id }, data: { status: OrderStatus.PAID } });
+ 
+       if (order.subscriptionId) {
+@@ -441,6 +489,19 @@ export class PaymentsService {
+       return subscription.id;
+     });
+ 
++    if (subscriptionId === null) {
++      // Lost the atomic claim above — a concurrent/earlier delivery of
++      // this same callback already owns (or already finished) processing
++      // it. Steps 3-6 (Telegram) were already triggered, or are about to
++      // be, by whichever call actually won the claim — running them again
++      // here would be a duplicate invite link / duplicate message, not a
++      // security issue but pure noise. Nothing further to do.
++      this.logger.debug(
++        `[applySuccessfulPayment] payment=${paymentId} already claimed by a concurrent delivery — skipping duplicate processing.`,
++      );
++      return;
++    }
++
+     this.logger.log(
+       `[applySuccessfulPayment] Steps 1-2/6 OK — payment=${paymentId} order=${order.id} subscription=${subscriptionId}`,
+     );
