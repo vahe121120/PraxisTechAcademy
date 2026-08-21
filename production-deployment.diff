@@ -1,0 +1,1921 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..b2fa9e7
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,109 @@
++# -----------------------------------------------------------------------------
++# Production environment for the docker-compose.yml stack at repo root.
++#
++# cp .env.example .env, then fill in every CHANGE_ME value before running
++# `docker compose up`. This file is read by docker-compose.yml via its
++# `${VAR}` interpolation — it is NOT read directly by the application code
++# inside either container (that still reads Admin_Panel_Backend/.env.example
++# and Frontend/praxis-web/.env.example's variable *names*, just supplied via
++# compose's `environment:`/`args:` instead of a mounted .env file). If a
++# variable exists in one of those two per-app files but is missing here,
++# docker-compose.yml's corresponding `environment:` entry resolves to an
++# empty string — check env.validation.ts's Joi schema will reject that at
++# backend boot rather than silently running with e.g. an empty JWT secret.
++#
++# NEVER commit the real .env — it holds live secrets. Only .env.example is
++# tracked in git.
++# -----------------------------------------------------------------------------
++
++# =============================================================================
++# PostgreSQL
++# =============================================================================
++POSTGRES_USER=praxis_app
++# Generate with: openssl rand -base64 32
++POSTGRES_PASSWORD=CHANGE_ME_use_openssl_rand_base64_32
++POSTGRES_DB=praxis
++
++# Built from the three values above — used by both the `migrate` service and
++# the running `backend` service. Host is `postgres` (the compose service
++# name; Docker's internal DNS resolves it), not `localhost` — a very common
++# copy-paste mistake when adapting a local .env into this one.
++#
++# DATABASE_URL and DIRECT_URL are identical here because this compose file
++# has the app connect straight to Postgres with no pooler in front of it. If
++# a pooler (PgBouncer / RDS Proxy / Supabase's pooler) is introduced later,
++# DATABASE_URL should point at the pooler and DIRECT_URL must keep pointing
++# directly at Postgres — `prisma migrate deploy` requires a direct,
++# non-pooled connection. See docs/MIGRATION_STRATEGY.md.
++DATABASE_URL=postgresql://praxis_app:CHANGE_ME_use_openssl_rand_base64_32@postgres:5432/praxis?schema=public
++DIRECT_URL=postgresql://praxis_app:CHANGE_ME_use_openssl_rand_base64_32@postgres:5432/praxis?schema=public
++
++# =============================================================================
++# Backend (Admin_Panel_Backend) — see its own .env.example for per-value
++# explanations; only the values themselves live here.
++# =============================================================================
++LOG_LEVEL=info
++
++# Comma-separated, no wildcard. Must be the frontend's real public origin —
++# a mismatch here doesn't fail loudly, it just makes every browser request
++# from the frontend silently fail CORS.
++CORS_ORIGIN=https://app.praxistech.academy
++
++THROTTLE_TTL_MS=60000
++THROTTLE_LIMIT=100
++
++# Generate distinct secrets for each — e.g. `openssl rand -hex 64` — never
++# reuse the same value for both, and never reuse a value from any other
++# environment (staging, local dev) in production.
++JWT_ACCESS_SECRET=CHANGE_ME_use_openssl_rand_hex_64_or_longer
++JWT_ACCESS_EXPIRES_IN=15m
++JWT_REFRESH_SECRET=CHANGE_ME_a_different_secret_from_the_access_one
++JWT_REFRESH_EXPIRES_IN=30d
++
++BCRYPT_SALT_ROUNDS=12
++
++# Shared parent domain so the refresh-token cookie reaches both the
++# frontend and API subdomains, e.g. ".praxistech.academy" — leading dot,
++# no scheme, no trailing slash.
++COOKIE_DOMAIN=.praxistech.academy
++
++# --- Payments (ARCA) ---------------------------------------------------------
++# From the issuing bank's merchant onboarding — never invent
++# placeholder-looking values for a real environment.
++ARCA_API_BASE_URL=https://CHANGE_ME.example.com/payment/rest
++ARCA_MERCHANT_LOGIN=CHANGE_ME
++ARCA_MERCHANT_PASSWORD=CHANGE_ME
++# Generate with: openssl rand -hex 32
++ARCA_WEBHOOK_SECRET=CHANGE_ME_generate_a_real_32_byte_hex_secret
++ARCA_RETURN_URL=https://app.praxistech.academy/payment/return
++ARCA_REQUEST_TIMEOUT_MS=15000
++ORDER_EXPIRY_MINUTES=30
++
++# --- Telegram -----------------------------------------------------------------
++# From @BotFather. Treat exactly like a password.
++TELEGRAM_BOT_TOKEN=CHANGE_ME_123456:ABC-your-real-bot-token
++TELEGRAM_BOT_USERNAME=PraxisAcademyBot
++TELEGRAM_API_BASE_URL=https://api.telegram.org
++# Set via setWebhook's secret_token parameter when registering the webhook
++# URL with Telegram. Generate with: openssl rand -hex 32
++TELEGRAM_WEBHOOK_SECRET=CHANGE_ME_generate_a_real_32_byte_hex_secret
++TELEGRAM_REQUEST_TIMEOUT_MS=10000
++TELEGRAM_INVITE_LINK_EXPIRY_MINUTES=1440
++
++# =============================================================================
++# Frontend (Frontend/praxis-web)
++# =============================================================================
++# Baked into the client bundle at IMAGE BUILD TIME (see
++# Frontend/praxis-web/Dockerfile's comment) — changing this value requires
++# `docker compose build frontend` again, not just a container restart, and
++# not just re-running `docker compose up`.
++NEXT_PUBLIC_API_URL=https://api.praxistech.academy
++
++# =============================================================================
++# Backups (ops/backup)
++# =============================================================================
++BACKUP_RETENTION_DAYS=14
++# Standard 5-field cron syntax, UTC (the container has no locale/timezone
++# configured — see docs/BACKUP_STRATEGY.md before changing this if the
++# intent is "3am in a specific timezone").
++BACKUP_SCHEDULE_CRON=0 3 * * *
+diff --git a/Admin_Panel_Backend/.dockerignore b/Admin_Panel_Backend/.dockerignore
+new file mode 100644
+index 0000000..c70c996
+--- /dev/null
++++ b/Admin_Panel_Backend/.dockerignore
+@@ -0,0 +1,30 @@
++node_modules
++dist
++coverage
++
++# Local env files must never enter the build context — secrets are injected
++# at container runtime via docker-compose's env_file/environment, never
++# baked into an image layer. .env.example is intentionally NOT excluded;
++# it contains no real secrets and documents the required shape.
++.env
++.env.*
++!.env.example
++
++.git
++.gitignore
++.github
++
++*.log
++npm-debug.log*
++
++.vscode
++.idea
++.DS_Store
++
++# Test artifacts and CI config have no place in a production image.
++test
++*.spec.ts
++jest.config.*
++
++README.md
++docs
+diff --git a/Admin_Panel_Backend/Dockerfile b/Admin_Panel_Backend/Dockerfile
+index 58d1cd1..1b97a54 100644
+--- a/Admin_Panel_Backend/Dockerfile
++++ b/Admin_Panel_Backend/Dockerfile
+@@ -29,6 +29,7 @@ COPY --from=build --chown=nestjs:nodejs /app/node_modules ./node_modules
+ COPY --from=build --chown=nestjs:nodejs /app/dist ./dist
+ COPY --from=build --chown=nestjs:nodejs /app/prisma ./prisma
+ COPY --from=build --chown=nestjs:nodejs /app/package.json ./package.json
++COPY --from=build --chown=nestjs:nodejs /app/scripts ./scripts
+ 
+ USER nestjs
+ 
+diff --git a/Admin_Panel_Backend/package-lock.json b/Admin_Panel_Backend/package-lock.json
+index 87d8ec7..a389630 100644
+--- a/Admin_Panel_Backend/package-lock.json
++++ b/Admin_Panel_Backend/package-lock.json
+@@ -32,6 +32,7 @@
+         "passport": "0.7.0",
+         "passport-jwt": "4.0.1",
+         "passport-local": "1.0.0",
++        "prisma": "6.19.3",
+         "reflect-metadata": "0.2.2",
+         "rxjs": "7.8.2"
+       },
+@@ -57,7 +58,6 @@
+         "globals": "17.9.0",
+         "jest": "30.4.2",
+         "prettier": "3.9.6",
+-        "prisma": "6.19.3",
+         "source-map-support": "0.5.21",
+         "supertest": "7.2.2",
+         "ts-jest": "29.4.12",
+@@ -2733,7 +2733,6 @@
+       "version": "6.19.3",
+       "resolved": "https://registry.npmjs.org/@prisma/config/-/config-6.19.3.tgz",
+       "integrity": "sha512-CBPT44BjlQxEt8kiMEauji2WHTDoVBOKl7UlewXmUgBPnr/oPRZC3psci5chJnYmH0ivEIog2OU9PGWoki3DLQ==",
+-      "devOptional": true,
+       "license": "Apache-2.0",
+       "dependencies": {
+         "c12": "3.1.0",
+@@ -2746,14 +2745,12 @@
+       "version": "6.19.3",
+       "resolved": "https://registry.npmjs.org/@prisma/debug/-/debug-6.19.3.tgz",
+       "integrity": "sha512-ljkJ+SgpXNktLG0Q/n4JGYCkKf0f8oYLyjImS2I8e2q2WCfdRRtWER062ZV/ixaNP2M2VKlWXVJiGzZaUgbKZw==",
+-      "devOptional": true,
+       "license": "Apache-2.0"
+     },
+     "node_modules/@prisma/engines": {
+       "version": "6.19.3",
+       "resolved": "https://registry.npmjs.org/@prisma/engines/-/engines-6.19.3.tgz",
+       "integrity": "sha512-RSYxtlYFl5pJ8ZePgMv0lZ9IzVCOdTPOegrs2qcbAEFrBI1G33h6wyC9kjQvo0DnYEhEVY0X4LsuFHXLKQk88g==",
+-      "devOptional": true,
+       "hasInstallScript": true,
+       "license": "Apache-2.0",
+       "dependencies": {
+@@ -2767,14 +2764,12 @@
+       "version": "7.1.1-3.c2990dca591cba766e3b7ef5d9e8a84796e47ab7",
+       "resolved": "https://registry.npmjs.org/@prisma/engines-version/-/engines-version-7.1.1-3.c2990dca591cba766e3b7ef5d9e8a84796e47ab7.tgz",
+       "integrity": "sha512-03bgb1VD5gvuumNf+7fVGBzfpJPjmqV423l/WxsWk2cNQ42JD0/SsFBPhN6z8iAvdHs07/7ei77SKu7aZfq8bA==",
+-      "devOptional": true,
+       "license": "Apache-2.0"
+     },
+     "node_modules/@prisma/fetch-engine": {
+       "version": "6.19.3",
+       "resolved": "https://registry.npmjs.org/@prisma/fetch-engine/-/fetch-engine-6.19.3.tgz",
+       "integrity": "sha512-tKtl/qco9Nt7LU5iKhpultD8O4vMCZcU2CHjNTnRrL1QvSUr5W/GcyFPjNL87GtRrwBc7ubXXD9xy4EvLvt8JA==",
+-      "devOptional": true,
+       "license": "Apache-2.0",
+       "dependencies": {
+         "@prisma/debug": "6.19.3",
+@@ -2786,7 +2781,6 @@
+       "version": "6.19.3",
+       "resolved": "https://registry.npmjs.org/@prisma/get-platform/-/get-platform-6.19.3.tgz",
+       "integrity": "sha512-xFj1VcJ1N3MKooOQAGO0W5tsd0W2QzIvW7DD7c/8H14Zmp4jseeWAITm+w2LLoLrlhoHdPPh0NMZ8mfL6puoHA==",
+-      "devOptional": true,
+       "license": "Apache-2.0",
+       "dependencies": {
+         "@prisma/debug": "6.19.3"
+@@ -4751,7 +4745,6 @@
+       "version": "3.1.0",
+       "resolved": "https://registry.npmjs.org/c12/-/c12-3.1.0.tgz",
+       "integrity": "sha512-uWoS8OU1MEIsOv8p/5a82c3H31LsWVR5qiyXVfBNOzfffjUWtPnhAb4BYI2uG2HfGmZmFjCtui5XNWaps+iFuw==",
+-      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "chokidar": "^4.0.3",
+@@ -4780,7 +4773,6 @@
+       "version": "16.6.1",
+       "resolved": "https://registry.npmjs.org/dotenv/-/dotenv-16.6.1.tgz",
+       "integrity": "sha512-uBq4egWHTcTt33a72vpSG0z3HnPuIl6NqYcTrKEg2azoEyl2hpW0zqlxysq2pK9HlDIHyHyakeYaYnSAwd8bow==",
+-      "devOptional": true,
+       "license": "BSD-2-Clause",
+       "engines": {
+         "node": ">=12"
+@@ -4907,7 +4899,6 @@
+       "version": "4.0.3",
+       "resolved": "https://registry.npmjs.org/chokidar/-/chokidar-4.0.3.tgz",
+       "integrity": "sha512-Qgzu8kfBvo+cA4962jnP1KkS6Dop5NS6g7R5LFYJr4b8Ub94PPQXUksCw9PvXoeXPRRddRNC5C1JQUR2SMGtnA==",
+-      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "readdirp": "^4.0.1"
+@@ -4949,7 +4940,6 @@
+       "version": "0.1.6",
+       "resolved": "https://registry.npmjs.org/citty/-/citty-0.1.6.tgz",
+       "integrity": "sha512-tskPPKEs8D2KPafUypv2gxwJP8h/OaJmC82QQGGDQcHvXX43xF2VDACcJVmZ0EuSxkpO9Kc4MlrA3q0+FG58AQ==",
+-      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "consola": "^3.2.3"
+@@ -5225,14 +5215,12 @@
+       "version": "0.2.4",
+       "resolved": "https://registry.npmjs.org/confbox/-/confbox-0.2.4.tgz",
+       "integrity": "sha512-ysOGlgTFbN2/Y6Cg3Iye8YKulHw+R2fNXHrgSmXISQdMnomY6eNDprVdW9R5xBguEqI954+S6709UyiO7B+6OQ==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/consola": {
+       "version": "3.4.2",
+       "resolved": "https://registry.npmjs.org/consola/-/consola-3.4.2.tgz",
+       "integrity": "sha512-5IKcdX0nnYavi6G7TtOhwkYzyjfJlatbjMjuLSfE2kYT5pMDOilZ4OvMhi637CcDICTmz3wARPoyhqyX1Y+XvA==",
+-      "devOptional": true,
+       "license": "MIT",
+       "engines": {
+         "node": "^14.18.0 || >=16.10.0"
+@@ -5445,7 +5433,6 @@
+       "version": "7.1.5",
+       "resolved": "https://registry.npmjs.org/deepmerge-ts/-/deepmerge-ts-7.1.5.tgz",
+       "integrity": "sha512-HOJkrhaYsweh+W+e74Yn7YStZOilkoPb6fycpwNLKzSPtruFs48nYis0zy5yJz1+ktUhHxoRDJ27RQAWLIJVJw==",
+-      "devOptional": true,
+       "license": "BSD-3-Clause",
+       "engines": {
+         "node": ">=16.0.0"
+@@ -5468,7 +5455,6 @@
+       "version": "6.1.7",
+       "resolved": "https://registry.npmjs.org/defu/-/defu-6.1.7.tgz",
+       "integrity": "sha512-7z22QmUWiQ/2d0KkdYmANbRUVABpZ9SNYyH5vx6PZ+nE5bcC0l7uFvEfHlyld/HcGBFTL536ClDt3DEcSlEJAQ==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/delayed-stream": {
+@@ -5494,7 +5480,6 @@
+       "version": "2.0.5",
+       "resolved": "https://registry.npmjs.org/destr/-/destr-2.0.5.tgz",
+       "integrity": "sha512-ugFTXCtDZunbzasqBxrK93Ik/DRYsO6S/fedkWEMKqt04xZ4csmnmwGDBAb07QWNaGMAmnTIemsYZCksjATwsA==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/detect-newline": {
+@@ -5607,7 +5592,6 @@
+       "version": "3.21.0",
+       "resolved": "https://registry.npmjs.org/effect/-/effect-3.21.0.tgz",
+       "integrity": "sha512-PPN80qRokCd1f015IANNhrwOnLO7GrrMQfk4/lnZRE/8j7UPWrNNjPV0uBrZutI/nHzernbW+J0hdqQysHiSnQ==",
+-      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "@standard-schema/spec": "^1.0.0",
+@@ -5644,7 +5628,6 @@
+       "version": "2.0.0",
+       "resolved": "https://registry.npmjs.org/empathic/-/empathic-2.0.0.tgz",
+       "integrity": "sha512-i6UzDscO/XfAcNYD75CfICkmfLedpyPDdozrLMmQc5ORaQcdMoc21OnlEylMIqI7U8eniKrPMxxtj8k0vhmJhA==",
+-      "devOptional": true,
+       "license": "MIT",
+       "engines": {
+         "node": ">=14"
+@@ -6165,14 +6148,12 @@
+       "version": "1.1.1",
+       "resolved": "https://registry.npmjs.org/exsolve/-/exsolve-1.1.1.tgz",
+       "integrity": "sha512-9U/jZUgjnSGyntRr6y5Muu1MJcwFl6kPu7k8qLF0IMNfLqvw0NZ4nnVDq0RVoZ0RvCyumib4Ez3KYrVfilrw+g==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/fast-check": {
+       "version": "3.23.2",
+       "resolved": "https://registry.npmjs.org/fast-check/-/fast-check-3.23.2.tgz",
+       "integrity": "sha512-h5+1OzzfCC3Ef7VbtKdcv7zsstUQwUDlYpUTvjeUsJAssPgLn7QzbboPtL5ro04Mq0rPOsMzl7q5hIbRs2wD1A==",
+-      "devOptional": true,
+       "funding": [
+         {
+           "type": "individual",
+@@ -6195,7 +6176,6 @@
+       "version": "6.1.0",
+       "resolved": "https://registry.npmjs.org/pure-rand/-/pure-rand-6.1.0.tgz",
+       "integrity": "sha512-bVWawvoZoBYpp6yIoQtQXHZjmz35RSVHnUOTefl8Vcjr8snTPY1wnpSPMWekcFwbxI6gtmT7rSYPFvz71ldiOA==",
+-      "devOptional": true,
+       "funding": [
+         {
+           "type": "individual",
+@@ -6683,7 +6663,6 @@
+       "version": "2.0.0",
+       "resolved": "https://registry.npmjs.org/giget/-/giget-2.0.0.tgz",
+       "integrity": "sha512-L5bGsVkxJbJgdnwyuheIunkGatUF/zssUoxxjACCseZYAVbaqdh9Tsmmlkl8vYan09H7sbvKt4pS8GqKLBrEzA==",
+-      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "citty": "^0.1.6",
+@@ -7979,7 +7958,6 @@
+       "version": "2.7.0",
+       "resolved": "https://registry.npmjs.org/jiti/-/jiti-2.7.0.tgz",
+       "integrity": "sha512-AC/7JofJvZGrrneWNaEnJeOLUx+JlGt7tNa0wZiRPT4MY1wmfKjt2+6O2p2uz2+skll8OZZmJMNqeke7kKbNgQ==",
+-      "devOptional": true,
+       "license": "MIT",
+       "bin": {
+         "jiti": "lib/jiti-cli.mjs"
+@@ -8810,7 +8788,6 @@
+       "version": "1.6.7",
+       "resolved": "https://registry.npmjs.org/node-fetch-native/-/node-fetch-native-1.6.7.tgz",
+       "integrity": "sha512-g9yhqoedzIUm0nTnTqAQvueMPVOuIY16bqgAJJC8XOOubYFNwz6IER9qs0Gq2Xd0+CecCKFjtdDTMA4u4xG06Q==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/node-gyp-build": {
+@@ -8868,7 +8845,6 @@
+       "version": "0.6.9",
+       "resolved": "https://registry.npmjs.org/nypm/-/nypm-0.6.9.tgz",
+       "integrity": "sha512-zxlE2yvSWZWmHcNdT3+5zV2lrCogeE9YOklHrR3dFjqutq5wO7GFDYLFDRXLsYnJzwvy/im9fYoxePvS0VTW0w==",
+-      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "citty": "^0.2.2",
+@@ -8886,7 +8862,6 @@
+       "version": "0.2.2",
+       "resolved": "https://registry.npmjs.org/citty/-/citty-0.2.2.tgz",
+       "integrity": "sha512-+6vJA3L98yv+IdfKGZHBNiGW5KHn22e/JwID0Strsz8h4S/csAu/OuICwxrg44k5MRiZHWIo8XXuJgQTriRP4w==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/object-assign": {
+@@ -8914,7 +8889,6 @@
+       "version": "2.0.11",
+       "resolved": "https://registry.npmjs.org/ohash/-/ohash-2.0.11.tgz",
+       "integrity": "sha512-RdR9FQrFwNBNXAr4GixM8YaRZRJ5PUWbKYbE5eOsrwAjJW0q2REGcf79oYPsLyskQCZG1PLN+S/K1V00joZAoQ==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/on-finished": {
+@@ -9223,7 +9197,6 @@
+       "version": "2.0.3",
+       "resolved": "https://registry.npmjs.org/pathe/-/pathe-2.0.3.tgz",
+       "integrity": "sha512-WUjGcAqP1gQacoQe+OBJsFA7Ld4DyXuUIjZ5cc75cLHvJ7dtNsTugphxIADwspS+AraAUePCKrSVtPLFj/F88w==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/pause": {
+@@ -9235,7 +9208,6 @@
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/perfect-debounce/-/perfect-debounce-1.0.0.tgz",
+       "integrity": "sha512-xCy9V055GLEqoFaHoC1SoLIaLmWctgCUaBaWxDZ7/Zx4CTyX7cJQLJOok/orfjZAh9kEYpjJa4d0KcJmCbctZA==",
+-      "devOptional": true,
+       "license": "MIT"
+     },
+     "node_modules/picocolors": {
+@@ -9341,7 +9313,6 @@
+       "version": "2.3.1",
+       "resolved": "https://registry.npmjs.org/pkg-types/-/pkg-types-2.3.1.tgz",
+       "integrity": "sha512-y+ichcgc2LrADuhLNAx8DFjVfgz91pRxfZdI3UDhxHvcVEZsenLO+7XaU5vOp0u/7V/wZ+plyuQxtrDlZJ+yeg==",
+-      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "confbox": "^0.2.4",
+@@ -9431,7 +9402,6 @@
+       "version": "6.19.3",
+       "resolved": "https://registry.npmjs.org/prisma/-/prisma-6.19.3.tgz",
+       "integrity": "sha512-++ZJ0ijLrDJF6hNB4t4uxg2br3fC4H9Yc9tcbjr2fcNFP3rh/SBNrAgjhsqBU4Ght8JPrVofG/ZkXfnSfnYsFg==",
+-      "devOptional": true,
+       "hasInstallScript": true,
+       "license": "Apache-2.0",
+       "dependencies": {
+@@ -9541,7 +9511,6 @@
+       "version": "2.1.2",
+       "resolved": "https://registry.npmjs.org/rc9/-/rc9-2.1.2.tgz",
+       "integrity": "sha512-btXCnMmRIBINM2LDZoEmOogIZU7Qe7zn4BpomSKZ/ykbLObuBdvG+mFq11DL6fjH1DRwHhrlgtYWG96bJiC7Cg==",
+-      "devOptional": true,
+       "license": "MIT",
+       "dependencies": {
+         "defu": "^6.1.4",
+@@ -9582,7 +9551,6 @@
+       "version": "4.1.2",
+       "resolved": "https://registry.npmjs.org/readdirp/-/readdirp-4.1.2.tgz",
+       "integrity": "sha512-GDhwkLfywWL2s6vEjyhri+eXmfH6j1L7JE27WhqLeYzoh/A3DBaYGEj2H/HFZCn/kMfim73FXxEJTw06WtxQwg==",
+-      "devOptional": true,
+       "license": "MIT",
+       "engines": {
+         "node": ">= 14.18.0"
+@@ -10531,7 +10499,6 @@
+       "version": "1.3.0",
+       "resolved": "https://registry.npmjs.org/tinyexec/-/tinyexec-1.3.0.tgz",
+       "integrity": "sha512-QKAl9m8gWWGHV8jZcPeym6j+XULi6tOf1mT83WYJ4Lk2ytW/uwAWkrP0uFsdoYMdueVJ0qs26wZ+23xeB4ibNQ==",
+-      "devOptional": true,
+       "license": "MIT",
+       "engines": {
+         "node": ">=18"
+diff --git a/Admin_Panel_Backend/package.json b/Admin_Panel_Backend/package.json
+index 84ca1d0..2842b97 100644
+--- a/Admin_Panel_Backend/package.json
++++ b/Admin_Panel_Backend/package.json
+@@ -37,12 +37,15 @@
+     "@nestjs/terminus": "11.1.1",
+     "@nestjs/throttler": "6.5.0",
+     "@prisma/client": "6.19.3",
++    "prisma": "6.19.3",
+     "bcrypt": "6.0.0",
+     "class-transformer": "0.5.1",
+     "class-validator": "0.15.1",
+     "compression": "1.8.1",
+     "cookie-parser": "1.4.7",
+     "helmet": "8.3.0",
++    "nestjs-pino": "4.4.1",
++    "pino-http": "10.6.0",
+     "joi": "18.2.3",
+     "libphonenumber-js": "1.13.10",
+     "ms": "2.1.3",
+@@ -87,8 +90,8 @@
+     "eslint-plugin-prettier": "5.5.6",
+     "globals": "17.9.0",
+     "jest": "30.4.2",
++    "pino-pretty": "13.1.2",
+     "prettier": "3.9.6",
+-    "prisma": "6.19.3",
+     "source-map-support": "0.5.21",
+     "supertest": "7.2.2",
+     "ts-jest": "29.4.12",
+diff --git a/Admin_Panel_Backend/scripts/docker-migrate.sh b/Admin_Panel_Backend/scripts/docker-migrate.sh
+new file mode 100755
+index 0000000..3303bc0
+--- /dev/null
++++ b/Admin_Panel_Backend/scripts/docker-migrate.sh
+@@ -0,0 +1,55 @@
++#!/usr/bin/env sh
++set -eu
++
++# -----------------------------------------------------------------------------
++# Runs `prisma migrate deploy` against DATABASE_URL and exits.
++#
++# WHY THIS IS ITS OWN SERVICE, NOT PART OF THE APP CONTAINER'S CMD:
++# `prisma migrate deploy` takes an advisory lock and IS safe to run
++# concurrently from multiple callers — but "safe" isn't the same as
++# "sensible." Baking it into every app replica's startup means N replicas
++# all attempt it on every deploy/restart, N-1 of them block on the lock and
++# log a confusing wait, and a migration failure surfaces as N crash-looped
++# containers instead of one clear failed step your deploy pipeline can gate
++# on. One explicit, single-purpose step is easier to reason about, easier to
++# alert on, and is what `docker compose`'s `depends_on: condition:
++# service_completed_successfully` is specifically designed for (see the
++# `migrate` service in docker-compose.yml).
++#
++# WHY A SEPARATE SCRIPT AND NOT JUST THE RAW COMMAND INLINE IN COMPOSE:
++# so the exact same script runs in CI/CD before a production deploy as runs
++# here — one source of truth for "how does this app migrate," not a command
++# duplicated (and liable to drift) between compose, a CI YAML file, and
++# anyone's terminal history.
++# -----------------------------------------------------------------------------
++
++if [ -z "${DATABASE_URL:-}" ]; then
++  echo "[migrate] FATAL: DATABASE_URL is not set." >&2
++  exit 1
++fi
++
++# DIRECT_URL is required by schema.prisma's datasource block for `migrate
++# deploy` specifically (it must bypass any connection pooler — PgBouncer,
++# RDS Proxy — and talk to the database directly, since migrations use
++# session-level features a transaction-pooled connection can break). Fail
++# loudly here rather than let Prisma's own, less specific error surface
++# first.
++if [ -z "${DIRECT_URL:-}" ]; then
++  echo "[migrate] FATAL: DIRECT_URL is not set (required for migrate deploy — must bypass any connection pooler)." >&2
++  exit 1
++fi
++
++echo "[migrate] Starting: prisma migrate deploy"
++echo "[migrate] Target: $(echo "$DATABASE_URL" | sed -E 's#(://[^:]+:)[^@]+(@)#\1***\2#')"
++
++# `migrate deploy` (not `migrate dev`): the production-safe command. It
++# never generates new migrations, never prompts, never resets data — it
++# only applies pending migration files already committed to
++# prisma/migrations/ in the exact order of their timestamps, and fails
++# loudly (nonzero exit, no partial silent success) if the migrations
++# directory and the database's `_prisma_migrations` history have diverged
++# (e.g. someone hand-edited a shipped migration file after it was already
++# applied elsewhere).
++npx prisma migrate deploy
++
++echo "[migrate] Completed successfully."
+diff --git a/Admin_Panel_Backend/src/app.module.ts b/Admin_Panel_Backend/src/app.module.ts
+index bd4a0a4..a1857cf 100644
+--- a/Admin_Panel_Backend/src/app.module.ts
++++ b/Admin_Panel_Backend/src/app.module.ts
+@@ -5,6 +5,7 @@ import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
+ 
+ import { AppConfigService } from './config/app-config.service';
+ import { AppConfigModule } from './config/config.module';
++import { LoggerModule } from './config/logger.module';
+ import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
+ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+ import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
+@@ -23,6 +24,7 @@ import { AdminModule } from './admin/admin.module';
+ @Module({
+   imports: [
+     AppConfigModule,
++    LoggerModule,
+     PrismaModule,
+     // Registered exactly once, here at the root — this is what activates
+     // @Cron() discovery app-wide (e.g. SubscriptionExpirationScheduler),
+diff --git a/Admin_Panel_Backend/src/auth/strategies/jwt-refresh.strategy.ts b/Admin_Panel_Backend/src/auth/strategies/jwt-refresh.strategy.ts
+index 71a5dfd..644ffc6 100644
+--- a/Admin_Panel_Backend/src/auth/strategies/jwt-refresh.strategy.ts
++++ b/Admin_Panel_Backend/src/auth/strategies/jwt-refresh.strategy.ts
+@@ -19,6 +19,9 @@ export class JwtRefreshStrategy extends PassportStrategy(Strategy, 'jwt-refresh'
+       jwtFromRequest: (req: Request) => extractRefreshToken(req),
+       ignoreExpiration: false,
+       secretOrKey: config.jwtRefreshSecret,
++      // See JwtStrategy for why this is pinned explicitly rather than left
++      // to jsonwebtoken's default inference.
++      algorithms: ['HS256'],
+       passReqToCallback: true,
+     });
+   }
+diff --git a/Admin_Panel_Backend/src/auth/strategies/jwt.strategy.ts b/Admin_Panel_Backend/src/auth/strategies/jwt.strategy.ts
+index 2435df2..6fa6d46 100644
+--- a/Admin_Panel_Backend/src/auth/strategies/jwt.strategy.ts
++++ b/Admin_Panel_Backend/src/auth/strategies/jwt.strategy.ts
+@@ -17,6 +17,10 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
+       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+       ignoreExpiration: false,
+       secretOrKey: config.jwtAccessSecret,
++      // Explicit allowlist rather than relying on jsonwebtoken's key-type
++      // inference to reject other algorithms — this secret is HMAC-only,
++      // and an access token should never verify under anything else.
++      algorithms: ['HS256'],
+     });
+   }
+ 
+diff --git a/Admin_Panel_Backend/src/config/logger.module.ts b/Admin_Panel_Backend/src/config/logger.module.ts
+new file mode 100644
+index 0000000..6ab80e0
+--- /dev/null
++++ b/Admin_Panel_Backend/src/config/logger.module.ts
+@@ -0,0 +1,126 @@
++import { Module } from '@nestjs/common';
++import { LoggerModule as PinoLoggerModule } from 'nestjs-pino';
++import { randomUUID } from 'crypto';
++import type { IncomingMessage, ServerResponse } from 'http';
++
++import { AppConfigModule } from './config.module';
++import { AppConfigService } from './app-config.service';
++import { REQUEST_ID_HEADER } from '../common/constants/app.constants';
++
++/**
++ * Replaces Nest's default console `Logger` with pino app-wide, via
++ * `app.useLogger(app.get(Logger))` in main.ts. This is intentionally a
++ * transparent swap, not a rewrite: every existing `new Logger('Context')`
++ * call site across the codebase (every service, every guard added during
++ * the security review — ArcaWebhookGuard, TelegramWebhookGuard, etc.)
++ * keeps working unchanged. What changes is the output format: structured
++ * JSON in production (one object per line — ingestible by any log
++ * aggregator without a parsing rule), human-readable colorized text in
++ * development (via pino-pretty, a devDependency never installed in the
++ * production image).
++ *
++ * WHY THIS REPLACES, RATHER THAN SUPPLEMENTS, THE EXISTING
++ * LoggingInterceptor (`common/interceptors/logging.interceptor.ts`):
++ * it doesn't — that interceptor still owns the one-line-per-request
++ * access log (success + failure, with latency), and its calls to
++ * `this.logger.log(...)` now transparently become structured JSON too,
++ * for free, because it already goes through Nest's `Logger`. This module
++ * additionally enables `pino-http`'s own request/response auto-logging
++ * (`pinoHttp` option below) at `debug` level only, so full request
++ * metadata (headers, response time) is available for deep debugging
++ * without duplicating the interceptor's concise access-log line at
++ * normal operating log levels.
++ */
++@Module({
++  imports: [
++    AppConfigModule,
++    PinoLoggerModule.forRootAsync({
++      imports: [AppConfigModule],
++      inject: [AppConfigService],
++      useFactory: (config: AppConfigService) => ({
++        pinoHttp: {
++          level: config.logLevel,
++
++          // Correlates every log line pino-http emits for a request with
++          // the same request id the app's own RequestIdMiddleware and
++          // AllExceptionsFilter already use — so a single failed request
++          // is findable across both by grepping/filtering one id, not two
++          // different ones from two independent id-generation schemes.
++          genReqId: (req: IncomingMessage, res: ServerResponse) => {
++            const existing = req.headers[REQUEST_ID_HEADER.toLowerCase()];
++            const id = typeof existing === 'string' && existing.trim().length > 0 ? existing : randomUUID();
++            res.setHeader(REQUEST_ID_HEADER, id);
++            return id;
++          },
++
++          // pino-http's own auto request/response logging stays at
++          // 'debug' regardless of the configured base level — the app's
++          // LoggingInterceptor already provides the normal-operation
++          // access log at 'log'/'info'; this is the opt-in, verbose,
++          // full-metadata version for active debugging, not something
++          // that should double up on every request in production by
++          // default.
++          customLogLevel: () => 'debug',
++
++          // --- Redaction --------------------------------------------------
++          // SECURITY: every field here is something that must never reach
++          // a log aggregator in plaintext, full stop — an access token, a
++          // refresh-token cookie, a password, or a webhook shared secret
++          // leaking into logs is equivalent to leaking it outright, since
++          // most log platforms have far broader read-access (support
++          // staff, dashboards, third-party log-drain integrations) than
++          // the database itself does. `pino`'s redact option replaces the
++          // matched value with `[Redacted]` rather than merely omitting
++          // the key, so the shape of the logged object doesn't change —
++          // deliberate, since a log line that silently drops a field is
++          // harder to debug against than one that visibly shows what was
++          // withheld and why.
++          redact: {
++            paths: [
++              'req.headers.authorization',
++              'req.headers.cookie',
++              'req.headers["x-arca-signature"]',
++              'req.headers["x-telegram-bot-api-secret-token"]',
++              'res.headers["set-cookie"]',
++              // Request/response bodies aren't logged by pino-http by
++              // default (only headers + metadata), so this list doesn't
++              // need to cover every DTO field — but any future change
++              // that turns body-logging on for debugging must also
++              // extend this list before shipping, not after.
++              '*.password',
++              '*.newPassword',
++              '*.currentPassword',
++              '*.accessToken',
++              '*.refreshToken',
++              '*.token',
++            ],
++            censor: '[Redacted]',
++          },
++
++          // Structured JSON in production; pretty, colorized, single-line
++          // human output in development. Never pino-pretty in production —
++          // it's not installed there at all (devDependency only), so this
++          // branch is also a hard guarantee, not just a preference.
++          transport: config.isProduction
++            ? undefined
++            : {
++                target: 'pino-pretty',
++                options: {
++                  colorize: true,
++                  singleLine: true,
++                  translateTime: 'HH:MM:ss.l',
++                  ignore: 'pid,hostname',
++                },
++              },
++
++          // Every log line gets both fields so a query against a log
++          // aggregator can filter by environment / service without
++          // relying on which index or stream it landed in.
++          base: { service: 'praxis-api', env: config.env },
++        },
++      }),
++    }),
++  ],
++  exports: [PinoLoggerModule],
++})
++export class LoggerModule {}
+diff --git a/Admin_Panel_Backend/src/main.ts b/Admin_Panel_Backend/src/main.ts
+index 5922f66..da3a8bc 100644
+--- a/Admin_Panel_Backend/src/main.ts
++++ b/Admin_Panel_Backend/src/main.ts
+@@ -1,6 +1,7 @@
+-import { Logger, RequestMethod, ValidationPipe, VersioningType } from '@nestjs/common';
++import { RequestMethod, ValidationPipe, VersioningType } from '@nestjs/common';
+ import { NestFactory } from '@nestjs/core';
+ import type { NestExpressApplication } from '@nestjs/platform-express';
++import { Logger } from 'nestjs-pino';
+ import compression from 'compression';
+ import cookieParser from 'cookie-parser';
+ import helmet from 'helmet';
+@@ -24,7 +25,15 @@ async function bootstrap(): Promise<void> {
+   });
+ 
+   const config = app.get(AppConfigService);
+-  const logger = new Logger('Bootstrap');
++
++  // Swaps Nest's default console Logger for the pino-backed one everywhere
++  // in the app — every existing `new Logger('Context')` call site (every
++  // service, every guard) keeps its call signature and now transparently
++  // emits structured JSON instead. Must happen before anything else logs,
++  // which is exactly why `bufferLogs: true` above exists: nothing from the
++  // window between NestFactory.create() and this line is lost.
++  const logger = app.get(Logger);
++  app.useLogger(logger);
+ 
+   // The app runs behind a reverse proxy / load balancer in every real
+   // deployment; without this, `req.ip` and the throttler's client-IP
+diff --git a/Admin_Panel_Backend/src/payments/payments.service.ts b/Admin_Panel_Backend/src/payments/payments.service.ts
+index d85e00a..60b58e2 100644
+--- a/Admin_Panel_Backend/src/payments/payments.service.ts
++++ b/Admin_Panel_Backend/src/payments/payments.service.ts
+@@ -245,13 +245,37 @@ export class PaymentsService {
+       return;
+     }
+ 
+-    if (result.status === 'SUCCEEDED') {
+-      await this.applySuccessfulPayment(payment.id, result, webhookEvent.id);
+-    } else if (result.status === 'FAILED') {
+-      await this.applyFailedPayment(payment.id, result);
++    // Wrapped the same way the verifyPayment() call above already is: this
++    // dispatch does real writes (Payment/Order/Subscription state, plus an
++    // external Telegram call) and must not be allowed to turn into an
++    // uncaught exception that reaches the controller as a non-200 — that
++    // breaks this webhook's own documented "always 200" contract and, on
++    // some ARCA-family bank implementations, risks the merchant's webhook
++    // being disabled after repeated non-2xx responses, which would silently
++    // stop *all* future payment confirmations, not just this one. The
++    // atomic claim inside applySuccessfulPayment (see its doc comment)
++    // closes the race that used to make this reachable; this catch is the
++    // second, independent layer — for that race and for anything else
++    // unanticipated.
++    try {
++      if (result.status === 'SUCCEEDED') {
++        await this.applySuccessfulPayment(payment.id, result, webhookEvent.id);
++      } else if (result.status === 'FAILED') {
++        await this.applyFailedPayment(payment.id, result);
++      }
++      // PENDING/UNKNOWN: nothing to apply yet — a later callback or the
++      // reconciliation sweep resolves it.
++    } catch (error) {
++      this.logger.error(
++        `Failed to apply webhook result for payment ${payment.id} (event ${webhookEvent.id})`,
++        error instanceof Error ? error.stack : String(error),
++      );
++      await this.markWebhookError(
++        webhookEvent.id,
++        `Failed to apply result: ${error instanceof Error ? error.message : String(error)}`,
++      );
++      return;
+     }
+-    // PENDING/UNKNOWN: nothing to apply yet — a later callback or the
+-    // reconciliation sweep resolves it.
+ 
+     await this.markWebhookProcessed(webhookEvent.id);
+   }
+@@ -354,9 +378,25 @@ export class PaymentsService {
+ 
+     // Step 1: confirm payment. Step 2: create subscription — both inside
+     // the transaction below.
++    //
++    // SECURITY: the TERMINAL_PAYMENT_STATUSES check in handleWebhook() is a
++    // plain read, not a lock — two concurrent deliveries of the same
++    // callback (normal for a payment gateway's retry behavior, and not
++    // something an attacker needs to trigger deliberately) can both read
++    // the payment as non-terminal and both reach this method before either
++    // one's transaction commits. The `updateMany` below is the actual
++    // concurrency guard: it makes "claim this payment for processing"
++    // atomic by folding the check into the write's WHERE clause, so the
++    // database — not two racing reads in application code — decides which
++    // execution wins. The loser's `count` comes back 0 and it returns
++    // immediately, before creating a second Subscription for the same
++    // (unique) Enrollment and throwing an uncaught P2002 that would
++    // otherwise surface as a non-200 response to ARCA (see the try/catch
++    // now wrapping this dispatch in handleWebhook, added as a second,
++    // independent layer of protection for that same contract).
+     const subscriptionId = await this.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+-      await tx.payment.update({
+-        where: { id: paymentId },
++      const claim = await tx.payment.updateMany({
++        where: { id: paymentId, status: { notIn: TERMINAL_PAYMENT_STATUSES } },
+         data: {
+           status: PaymentStatus.SUCCEEDED,
+           approvalCode: result.approvalCode,
+@@ -368,6 +408,14 @@ export class PaymentsService {
+         },
+       });
+ 
++      if (claim.count === 0) {
++        // Lost the race (or this is a genuine duplicate delivery) — a
++        // concurrent/earlier call already claimed and is processing (or
++        // has already processed) this payment. Nothing left to do here;
++        // returning null short-circuits Steps 2 onward.
++        return null;
++      }
++
+       await tx.order.update({ where: { id: order.id }, data: { status: OrderStatus.PAID } });
+ 
+       if (order.subscriptionId) {
+@@ -441,6 +489,19 @@ export class PaymentsService {
+       return subscription.id;
+     });
+ 
++    if (subscriptionId === null) {
++      // Lost the atomic claim above — a concurrent/earlier delivery of
++      // this same callback already owns (or already finished) processing
++      // it. Steps 3-6 (Telegram) were already triggered, or are about to
++      // be, by whichever call actually won the claim — running them again
++      // here would be a duplicate invite link / duplicate message, not a
++      // security issue but pure noise. Nothing further to do.
++      this.logger.debug(
++        `[applySuccessfulPayment] payment=${paymentId} already claimed by a concurrent delivery — skipping duplicate processing.`,
++      );
++      return;
++    }
++
+     this.logger.log(
+       `[applySuccessfulPayment] Steps 1-2/6 OK — payment=${paymentId} order=${order.id} subscription=${subscriptionId}`,
+     );
+diff --git a/Frontend/praxis-web/.dockerignore b/Frontend/praxis-web/.dockerignore
+new file mode 100644
+index 0000000..4598e01
+--- /dev/null
++++ b/Frontend/praxis-web/.dockerignore
+@@ -0,0 +1,21 @@
++node_modules
++.next
++out
++coverage
++
++.env
++.env.*
++!.env.example
++
++.git
++.gitignore
++.github
++
++*.log
++npm-debug.log*
++
++.vscode
++.idea
++.DS_Store
++
++README.md
+diff --git a/Frontend/praxis-web/Dockerfile b/Frontend/praxis-web/Dockerfile
+new file mode 100644
+index 0000000..8b2148d
+--- /dev/null
++++ b/Frontend/praxis-web/Dockerfile
+@@ -0,0 +1,53 @@
++# syntax=docker/dockerfile:1
++
++# ---- deps: install full dependency tree once, cached across builds -------
++FROM node:22-bookworm-slim AS deps
++WORKDIR /app
++COPY package.json package-lock.json ./
++RUN npm ci
++
++# ---- build: compile the Next.js production build ---------------------------
++FROM node:22-bookworm-slim AS build
++WORKDIR /app
++COPY --from=deps /app/node_modules ./node_modules
++COPY . .
++
++# NEXT_PUBLIC_* variables are inlined into the client JS bundle at build
++# time, not read from the environment at container start — this is a
++# Next.js constraint, not a choice made here. That means the API's public
++# base URL must be known at image-build time, via a build ARG, and a
++# separate image has to be built per environment if that URL differs
++# between staging and production (see docker-compose.yml's `build.args` and
++# DEPLOYMENT.md for the concrete implication: this image is NOT
++# "build once, deploy anywhere" the way the backend's image is).
++ARG NEXT_PUBLIC_API_URL
++ENV NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
++
++RUN npm run build
++
++# ---- runtime: minimal final image, non-root user, standalone server -------
++FROM node:22-bookworm-slim AS runtime
++ENV NODE_ENV=production
++WORKDIR /app
++
++RUN groupadd --gid 1001 nodejs \
++  && useradd --uid 1001 --gid nodejs --shell /bin/false --create-home nextjs
++
++# `output: 'standalone'` (next.config.ts) traces and copies only the files
++# each page actually needs, plus a minimal `node_modules` subset and a
++# self-contained `server.js` — this is what makes the runtime image small
++# and avoids shipping devDependencies or the full dependency tree.
++COPY --from=build --chown=nextjs:nodejs /app/.next/standalone ./
++COPY --from=build --chown=nextjs:nodejs /app/.next/static ./.next/static
++COPY --from=build --chown=nextjs:nodejs /app/public ./public
++
++USER nextjs
++
++ENV PORT=3000
++ENV HOSTNAME=0.0.0.0
++EXPOSE 3000
++
++HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
++  CMD node -e "require('http').get('http://127.0.0.1:3000/api/health', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"
++
++CMD ["node", "server.js"]
+diff --git a/Frontend/praxis-web/app/api/health/route.ts b/Frontend/praxis-web/app/api/health/route.ts
+new file mode 100644
+index 0000000..a7647c7
+--- /dev/null
++++ b/Frontend/praxis-web/app/api/health/route.ts
+@@ -0,0 +1,22 @@
++import { NextResponse } from "next/server";
++
++/**
++ * Liveness check for the Next.js server process itself — intentionally has
++ * zero dependencies (no call to praxis-api, no env/config read beyond what
++ * Next.js already needs to boot). This mirrors the backend's `/health/live`
++ * vs `/health/ready` split (see Admin_Panel_Backend/src/health): a frontend
++ * container that can't reach the API is a real problem, but it isn't a
++ * reason for the orchestrator to kill and restart *this* container — the
++ * API being down doesn't mean the Next.js server itself is unhealthy, and
++ * treating it that way would turn a backend outage into a frontend restart
++ * storm too. Route handlers are dynamic by default when they read request
++ * data; this one reads none, so Next.js may attempt to statically optimize
++ * it — force-dynamic guarantees every request actually re-executes rather
++ * than serving a cached response from build time, which matters once other
++ * checks (e.g. a build-time-only value) are ever added here.
++ */
++export const dynamic = "force-dynamic";
++
++export function GET(): NextResponse {
++  return NextResponse.json({ status: "ok" }, { status: 200 });
++}
+diff --git a/Frontend/praxis-web/next.config.ts b/Frontend/praxis-web/next.config.ts
+index 0f46554..acba9db 100644
+--- a/Frontend/praxis-web/next.config.ts
++++ b/Frontend/praxis-web/next.config.ts
+@@ -2,6 +2,12 @@ import type { NextConfig } from "next";
+ 
+ const nextConfig: NextConfig = {
+   reactStrictMode: true,
++  // Traces the minimal set of files/dependencies each page actually needs
++  // and emits a self-contained `.next/standalone` server — without this,
++  // the production image would have to ship the entire node_modules tree
++  // (including every devDependency's transitive deps) instead of a pruned
++  // ~50MB runtime. This is what the Dockerfile's runtime stage copies.
++  output: 'standalone',
+   // Server-side fetches (SSR pages, route handlers) call the API directly.
+   // Keep the base URL server-only where possible; NEXT_PUBLIC_API_URL exists
+   // only because client components (PurchaseButton, AuthContext) also need it.
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000..3b79624
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,227 @@
++# -----------------------------------------------------------------------------
++# Production compose for PraxisTechAcademy.
++#
++# Scope note: this targets Admin_Panel_Backend/ and Frontend/praxis-web/,
++# confirmed (see SECURITY_REVIEW_VERIFIED.md) as the most complete,
++# cumulative snapshots of the backend and frontend respectively, out of the
++# repo's several overlapping project folders. If a different folder is
++# actually the deployment target, update the two `build.context` paths
++# below — nothing else in this file depends on which folder it is.
++#
++# This is a single-host compose deployment (one Postgres instance, one
++# backend replica, one frontend replica) — the right shape for a first
++# production launch. See docs/DEPLOYMENT.md for what changes if/when this
++# needs to scale beyond one host (backend is already stateless/horizontally
++# scalable as written; Postgres is not, without adding a managed
++# replica/failover setup that's out of scope for a docker-compose file).
++#
++# USAGE:
++#   cp .env.example .env        # then fill in every CHANGE_ME value
++#   docker compose build
++#   docker compose up -d
++#   docker compose logs -f backend frontend
++# -----------------------------------------------------------------------------
++
++services:
++  postgres:
++    image: postgres:17-alpine
++    restart: unless-stopped
++    environment:
++      POSTGRES_USER: ${POSTGRES_USER}
++      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
++      POSTGRES_DB: ${POSTGRES_DB}
++      # Matches Prisma's default schema.prisma encoding assumption and
++      # avoids the well-known "sorts/compares differently than expected"
++      # class of bugs that comes from an unset/inherited-from-OS locale.
++      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
++    # No `ports:` mapping to the host — Postgres is only reachable from
++    # other containers on the `internal` network below. Exposing 5432 to
++    # the host is a common way a database that was only ever meant to be
++    # reached by the app ends up reachable from the public internet the
++    # moment the host's firewall config drifts.
++    networks:
++      - internal
++    volumes:
++      - praxis_postgres_data:/var/lib/postgresql/data
++      # Mounted into the backup service too (see below) — pg_dump reads
++      # the live cluster over the Postgres wire protocol, not this volume
++      # directly, but co-locating them keeps the backup script's target
++      # directory on the same host filesystem for straightforward off-host
++      # syncing (rclone/rsync/aws s3 sync) by a cron job outside this
++      # compose file.
++      - praxis_postgres_backups:/backups
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
++      interval: 5s
++      timeout: 5s
++      retries: 10
++    deploy:
++      resources:
++        limits:
++          cpus: "1.0"
++          memory: 1G
++        reservations:
++          memory: 256M
++
++  # One-shot migration runner. Applies any pending Prisma migrations and
++  # exits — `backend` waits on this succeeding before it starts (see
++  # `depends_on` below), so a failed migration blocks the deploy instead of
++  # the app starting up against a schema it doesn't match. See
++  # docs/MIGRATION_STRATEGY.md for why this is a separate service rather
++  # than baked into the backend container's own startup.
++  migrate:
++    build:
++      context: ./Admin_Panel_Backend
++      dockerfile: Dockerfile
++    restart: "no"
++    command: ["sh", "scripts/docker-migrate.sh"]
++    environment:
++      DATABASE_URL: ${DATABASE_URL}
++      DIRECT_URL: ${DIRECT_URL}
++    networks:
++      - internal
++    depends_on:
++      postgres:
++        condition: service_healthy
++
++  backend:
++    build:
++      context: ./Admin_Panel_Backend
++      dockerfile: Dockerfile
++    restart: unless-stopped
++    environment:
++      NODE_ENV: production
++      PORT: 3000
++      CORS_ORIGIN: ${CORS_ORIGIN}
++      LOG_LEVEL: ${LOG_LEVEL}
++      DATABASE_URL: ${DATABASE_URL}
++      DIRECT_URL: ${DIRECT_URL}
++      THROTTLE_TTL_MS: ${THROTTLE_TTL_MS}
++      THROTTLE_LIMIT: ${THROTTLE_LIMIT}
++      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
++      JWT_ACCESS_EXPIRES_IN: ${JWT_ACCESS_EXPIRES_IN}
++      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
++      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN}
++      BCRYPT_SALT_ROUNDS: ${BCRYPT_SALT_ROUNDS}
++      COOKIE_DOMAIN: ${COOKIE_DOMAIN}
++      ARCA_API_BASE_URL: ${ARCA_API_BASE_URL}
++      ARCA_MERCHANT_LOGIN: ${ARCA_MERCHANT_LOGIN}
++      ARCA_MERCHANT_PASSWORD: ${ARCA_MERCHANT_PASSWORD}
++      ARCA_WEBHOOK_SECRET: ${ARCA_WEBHOOK_SECRET}
++      ARCA_RETURN_URL: ${ARCA_RETURN_URL}
++      ARCA_REQUEST_TIMEOUT_MS: ${ARCA_REQUEST_TIMEOUT_MS}
++      ORDER_EXPIRY_MINUTES: ${ORDER_EXPIRY_MINUTES}
++      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
++      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME}
++      TELEGRAM_API_BASE_URL: ${TELEGRAM_API_BASE_URL}
++      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
++      TELEGRAM_REQUEST_TIMEOUT_MS: ${TELEGRAM_REQUEST_TIMEOUT_MS}
++      TELEGRAM_INVITE_LINK_EXPIRY_MINUTES: ${TELEGRAM_INVITE_LINK_EXPIRY_MINUTES}
++    networks:
++      - internal
++      - edge
++    depends_on:
++      migrate:
++        condition: service_completed_successfully
++      postgres:
++        condition: service_healthy
++    healthcheck:
++      test:
++        [
++          "CMD",
++          "node",
++          "-e",
++          "require('http').get('http://127.0.0.1:3000/health/live',(r)=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
++        ]
++      interval: 30s
++      timeout: 5s
++      start_period: 20s
++      retries: 3
++    deploy:
++      resources:
++        limits:
++          cpus: "1.0"
++          memory: 512M
++        reservations:
++          memory: 128M
++
++  frontend:
++    build:
++      context: ./Frontend/praxis-web
++      dockerfile: Dockerfile
++      args:
++        # Baked into the client bundle at build time — see the Dockerfile
++        # comment on why this can't be a normal runtime environment
++        # variable the way every backend variable above is.
++        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
++    restart: unless-stopped
++    networks:
++      - edge
++    depends_on:
++      backend:
++        condition: service_healthy
++    healthcheck:
++      test:
++        [
++          "CMD",
++          "node",
++          "-e",
++          "require('http').get('http://127.0.0.1:3000/api/health',(r)=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
++        ]
++      interval: 30s
++      timeout: 5s
++      start_period: 15s
++      retries: 3
++    deploy:
++      resources:
++        limits:
++          cpus: "1.0"
++          memory: 512M
++        reservations:
++          memory: 128M
++
++  # Reverse proxy / TLS termination is deliberately NOT included here — see
++  # docs/DEPLOYMENT.md. Terminating TLS correctly (cert issuance/renewal,
++  # HSTS, the ACME HTTP-01 challenge path) is enough of its own concern
++  # that it belongs in whatever this is actually deployed behind (a
++  # managed load balancer, or an explicitly-versioned Caddy/Traefik/nginx
++  # config tracked separately) rather than a minimal inline service here
++  # that would be the first thing anyone reflexively deletes or forgets to
++  # harden.
++
++  # Nightly logical backup. Runs pg_dump on a schedule inside the container
++  # (no host cron dependency) and prunes old backups per
++  # BACKUP_RETENTION_DAYS. See docs/BACKUP_STRATEGY.md for the full
++  # strategy, restore drill process, and off-host replication
++  # recommendation (this alone protects against data corruption/accidental
++  # deletion, NOT against total host loss, unless BACKUP_REMOTE_SYNC is
++  # also configured to ship these off-host).
++  backup:
++    build:
++      context: ./ops/backup
++      dockerfile: Dockerfile
++    restart: unless-stopped
++    environment:
++      DATABASE_URL: ${DATABASE_URL}
++      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
++      BACKUP_SCHEDULE_CRON: ${BACKUP_SCHEDULE_CRON:-0 3 * * *}
++    networks:
++      - internal
++    depends_on:
++      postgres:
++        condition: service_healthy
++    volumes:
++      - praxis_postgres_backups:/backups
++
++networks:
++  # Postgres and the migration/backup jobs live only here — never reachable
++  # from outside the Docker host, and not reachable from `frontend` either
++  # (it has no reason to talk to the database directly).
++  internal:
++  # backend and frontend share this network so the reverse proxy in front
++  # of the host can reach both; postgres is deliberately not attached to it.
++  edge:
++
++volumes:
++  praxis_postgres_data:
++  praxis_postgres_backups:
+diff --git a/docs/BACKUP_STRATEGY.md b/docs/BACKUP_STRATEGY.md
+new file mode 100644
+index 0000000..70cad13
+--- /dev/null
++++ b/docs/BACKUP_STRATEGY.md
+@@ -0,0 +1,104 @@
++# Backup strategy
++
++## What's implemented (`ops/backup/`)
++
++A dedicated `backup` container (see `docker-compose.yml`) that:
++1. Takes an immediate `pg_dump` on first start (so a freshly deployed stack
++   isn't backup-less for up to 24h waiting on the schedule).
++2. Runs `pg_dump --format=custom` on the schedule in `BACKUP_SCHEDULE_CRON`
++   (default: daily at 03:00 UTC), writing to a Docker named volume
++   (`praxis_postgres_backups`) shared with the `postgres` service.
++3. Prunes backups older than `BACKUP_RETENTION_DAYS` (default: 14) after
++   every successful run.
++
++Custom format (`-Fc`), not plain SQL: it's compressed, and restorable
++selectively or in parallel via `pg_restore` (a specific table, schema-only,
++data-only) rather than only "the whole file or nothing" the way a plain
++`.sql` dump forces.
++
++## What this protects against, and what it doesn't
++
++**Protects against:** accidental data deletion, a bad migration, application
++bugs that corrupt data, a compromised admin account making destructive
++changes — anything where you need to go back to a known-good point in time
++on the *same* infrastructure.
++
++**Does NOT protect against:** total loss of the Docker host itself (disk
++failure, host deleted, datacenter/region outage). The backup volume lives
++on the same host as the database it's backing up. **This is the single
++biggest gap in the current setup and needs a decision, not just
++awareness of it:**
++
++- **Minimum viable fix:** a scheduled job *outside* this compose stack
++  (host cron, or a small addition to the `backup` container) that syncs
++  `/backups` to off-host object storage — `aws s3 sync`, `rclone`, or
++  equivalent. Not implemented here because it requires choosing a specific
++  provider/credentials, which is an infrastructure decision, not a code
++  one.
++- **Stronger option, if/when this graduates off a single Docker host:** a
++  managed Postgres provider (RDS, Cloud SQL, Neon, Supabase) with built-in
++  point-in-time recovery and cross-region backup replication, which
++  removes this entire category of risk rather than mitigating it.
++
++Until off-host replication exists in some form, treat this backup system
++as protecting against *application-level* mistakes, not *infrastructure*
++loss.
++
++## Retention policy
++
++14 days by default (`BACKUP_RETENTION_DAYS`). Rationale: covers "we didn't
++notice a data problem until the following work week," which is the
++realistic detection window for most issues that aren't caught immediately.
++Extend it if the business needs longer historical recovery (e.g.
++regulatory/financial record-keeping requirements) — that's a policy
++decision this document can't make on your behalf, only flag as one to
++make deliberately rather than leave at the code default.
++
++## Restore process
++
++`ops/backup/restore.sh <backup-file> <target-database-url>` —
++deliberately **manual-only**, never wired into any automated path. A
++restore is destructive (`pg_restore --clean` drops existing objects before
++recreating them) and must always be a deliberate action against a specific
++incident, taken by a person, never something a misconfigured schedule
++could trigger.
++
++The script requires typing the target database's name back as
++confirmation before proceeding — a deliberate extra step given the
++consequence of running it against the wrong target.
++
++```bash
++# From inside the backup container, or anywhere with pg_restore + network
++# access to the target database:
++./ops/backup/restore.sh /backups/praxis_20260817T030000Z.dump \
++  "postgresql://praxis_app:PASSWORD@postgres:5432/praxis?schema=public"
++```
++
++## Restore drills — the part every backup strategy is missing until it isn't
++
++**A backup that has never been restored is not a verified backup.**
++Corruption, an incomplete dump, or a format incompatibility can all sit
++undetected in a backup file for months. Concretely:
++
++- Monthly (or after any major schema migration), restore the most recent
++  backup into a scratch database — never production — and verify: the
++  restore command exits 0, row counts on a few key tables look sane
++  (`orders`, `payments`, `subscriptions`), and the application actually
++  boots and reads correctly against the restored database.
++- This isn't automated here deliberately — a "successful" automated
++  restore-drill script that's never actually looked at by a human is only
++  marginally better than not drilling at all. Put it on a calendar, not
++  just in a cron job.
++
++## Logging and monitoring the backup process itself
++
++`entrypoint.sh` runs cron with `-d 8` (debug logging to stderr), and
++`backup.sh` logs start/success/failure/pruning to stdout — both land in
++`docker compose logs backup` / whatever log aggregator is set up per
++`docs/LOGGING_STRATEGY.md`. **Alert on backup failure specifically** —a
++silently-failing nightly backup is the worst version of this problem,
++since nothing looks wrong until the day a restore is actually needed. At
++minimum, a scheduled check (even a simple daily script checking that a
++`praxis_*.dump` file newer than 25 hours exists in the backup volume)
++wired to whatever alerting the team already uses is worth the half hour it
++takes to set up.
+diff --git a/docs/DEPLOYMENT.md b/docs/DEPLOYMENT.md
+new file mode 100644
+index 0000000..ed01444
+--- /dev/null
++++ b/docs/DEPLOYMENT.md
+@@ -0,0 +1,114 @@
++# Deployment guide
++
++## Scope of this compose stack
++
++Targets `Admin_Panel_Backend/` and `Frontend/praxis-web/` — confirmed (see
++`SECURITY_REVIEW_VERIFIED.md`) as the most complete, cumulative snapshots
++of the backend and frontend, out of this repo's several overlapping
++project folders (a known, separately-flagged structural issue — see that
++review's "open items"). If a different folder turns out to be the actual
++deployment target, the fix is two path changes in `docker-compose.yml`
++(`build.context` for `backend`/`migrate` and for `frontend`) — nothing else
++here depends on which folder it is.
++
++## Before the first deploy — in order
++
++1. **Generate the baseline Prisma migration.** Not optional, not something
++   this stack works around — see `docs/MIGRATION_STRATEGY.md`. Without it,
++   `docker compose up` will boot a backend against an empty database.
++2. **Fill in `.env`** from `.env.example` at the repo root. Every
++   `CHANGE_ME` needs a real value — `env.validation.ts`'s Joi schema
++   (backend) will refuse to boot on a missing/too-short secret, which is
++   the intended behavior, not a bug to work around.
++3. **Put a reverse proxy / TLS terminator in front of this.** Deliberately
++   not included in `docker-compose.yml` — see that file's comment on why
++   (TLS cert issuance/renewal and HSTS configuration deserve their own
++   explicitly-versioned config, not a bare inline service that's the first
++   thing anyone forgets to harden). Whatever's chosen (managed load
++   balancer, or a tracked Caddy/Traefik/nginx config) needs to route:
++   - `https://app.<domain>` → `frontend:3000`
++   - `https://api.<domain>` → `backend:3000`
++   - Both endpoints on the same parent domain as `COOKIE_DOMAIN` in
++     `.env`, or the refresh-token cookie (see the earlier security review)
++     never reaches the API.
++4. **Register the Telegram webhook** against the real public URL, with
++   `secret_token` set to `TELEGRAM_WEBHOOK_SECRET` from `.env` — this is a
++   one-time `setWebhook` API call, not something this stack automates
++   (registering it automatically at container start would mean every
++   restart re-registers against whatever URL the container currently
++   thinks it's reachable at, which is fragile and better done deliberately
++   once per real domain change).
++5. **Configure ARCA's webhook URL** with the bank, similarly, pointed at
++   `https://api.<domain>/api/v1/payments/arca/webhook` (route confirmed in
++   `payments.controller.ts`). Telegram's webhook (step 4) goes to
++   `https://api.<domain>/api/v1/telegram/webhook`, confirmed in
++   `telegram-webhook.controller.ts`.
++
++## Running it
++
++```bash
++cp .env.example .env   # then fill in every CHANGE_ME
++docker compose build
++docker compose up -d
++docker compose logs -f migrate   # confirm the baseline migration applied
++docker compose logs -f backend frontend
++```
++
++`docker compose ps` should show `postgres` and `backend` as `healthy`
++(their `HEALTHCHECK`/`healthcheck:` config), `migrate` as `Exited (0)`
++(one-shot, expected to exit — not evidence something is wrong), and
++`backup` running continuously.
++
++## What's verified vs. what isn't — read this before trusting any of it blind
++
++Everything in this deployment setup was written against the real,
++cloned source (Dockerfiles reference actual scripts/paths that exist,
++`docker-compose.yml`'s env var names match what `env.validation.ts`
++actually requires, the frontend's build-time `NEXT_PUBLIC_API_URL`
++requirement matches its one actual usage in `lib/api/http.ts`) — this
++isn't a generic template with placeholders guessed at.
++
++**What it is NOT: built or run.** This sandbox has no Docker daemon and
++cannot reach `binaries.prisma.sh` (needed for `npm ci`'s Prisma postinstall
++step) or Alpine's package mirrors (needed to actually build the `backup`
++image). Concretely, before trusting this in production:
++
++- [ ] `docker compose build` actually succeeds for all three custom images
++      (`backend`, `frontend`, `backup`) in an environment with normal
++      internet access.
++- [ ] The baseline migration (step 1 above) has been generated and
++      committed — the `migrate` service is inert without it.
++- [ ] `docker compose up` boots cleanly end-to-end: `migrate` applies the
++      baseline, `postgres`/`backend` report healthy, `frontend` can reach
++      `backend` at the configured `NEXT_PUBLIC_API_URL`.
++- [ ] A full login → browse courses → purchase → webhook confirms →
++      Telegram access granted flow works against the containerized stack,
++      not just against `npm run start:dev` locally.
++- [ ] The backup container actually produces a `praxis_*.dump` file and
++      `ops/backup/restore.sh` successfully restores it into a scratch
++      database (see `docs/BACKUP_STRATEGY.md`'s restore-drill guidance —
++      do this once now, not for the first time during a real incident).
++
++None of this is a formality — treat the checklist above as required
++verification before this is the thing serving real payment traffic, the
++same way the earlier security-fix diff was clearly marked
++manually-verified rather than compiler-verified until you ran the real
++build.
++
++## What scales and what doesn't, as written
++
++- `backend` and `frontend` are stateless (no in-memory session data beyond
++  a single request; auth state is JWT + database) — horizontally scalable
++  by simply increasing replica count once this graduates beyond a single
++  Docker host, with no code changes.
++- `postgres` is a single instance with no replication/failover — the
++  right shape for launch, not for a workload that needs to survive a
++  database host failure without downtime. See
++  `docs/BACKUP_STRATEGY.md`'s note on migrating to a managed Postgres
++  provider when that matters.
++- Session/rate-limit state (`@nestjs/throttler`) is in-memory per backend
++  instance today — fine at one replica; if `backend` is ever scaled to
++  multiple replicas, the throttler needs a shared store (Redis) or each
++  replica enforces its limit independently, meaning the *effective*
++  combined rate limit becomes `limit × replica count`. Worth revisiting
++  at that point, not before.
+diff --git a/docs/LOGGING_STRATEGY.md b/docs/LOGGING_STRATEGY.md
+new file mode 100644
+index 0000000..bb9757f
+--- /dev/null
++++ b/docs/LOGGING_STRATEGY.md
+@@ -0,0 +1,100 @@
++# Logging strategy
++
++## What's implemented
++
++**Backend:** structured JSON logging via `nestjs-pino`
++(`src/config/logger.module.ts`), swapped in as Nest's app-wide logger in
++`main.ts` (`app.useLogger(app.get(Logger))`). This is a transparent
++replacement, not a rewrite — every existing `new Logger('Context')` call
++site across the codebase (every service, every guard, including
++`ArcaWebhookGuard`/`TelegramWebhookGuard` and the rest added during the
++earlier security review) keeps its exact call signature and now emits
++structured JSON automatically.
++
++- **Production:** one JSON object per line to stdout — no pretty-printing
++  transform, since that would require `pino-pretty` (a devDependency,
++  correctly not present in the production image) and because JSON-per-line
++  is what every log aggregator (Loki, CloudWatch Logs, Datadog, ELK)
++  expects natively, with no custom parsing rule needed.
++- **Development:** colorized, single-line, human-readable output via
++  `pino-pretty`.
++- **Correlation:** every log line for a given request carries the same
++  `x-request-id` the app's existing `RequestIdMiddleware` already
++  generates/propagates — `pino-http`'s `genReqId` reads the same header
++  and constant (`REQUEST_ID_HEADER`) rather than an independent ID scheme,
++  so a single failed request is findable by filtering logs on one id, not
++  reconciling two different generators.
++- **Redaction:** `Authorization`, `Cookie`, `Set-Cookie`, the ARCA
++  signature header, the Telegram secret-token header, and any
++  `password`/`token`-shaped field are replaced with `[Redacted]` before a
++  log line is ever emitted — not filtered after the fact, not relying on
++  every call site remembering not to log a secret.
++- **Existing access-log line** (`common/interceptors/logging.interceptor.ts`)
++  is unchanged in behavior — one line per request with method, path, status,
++  latency, and request id — and now also outputs as structured JSON for
++  free, since it already goes through Nest's `Logger`.
++
++**Frontend:** no server-side structured logging added — Next.js's own
++build/runtime console output is left as-is. If custom server-side logging
++becomes necessary (e.g. logging route-handler errors with context), the
++same pino pattern applies; nothing about the frontend today generates log
++volume that needs more than what the platform already gives you via
++`docker compose logs frontend`.
++
++## Log levels — what goes where
++
++`LOG_LEVEL` (env var, default `info` in production per `.env.example`,
++`debug` in local dev) controls the floor. Guidance for choosing a level on
++a given log call, for whoever adds the next one:
++
++| Level | Use for |
++|---|---|
++| `error` | Something failed and needs a human to look at it — an uncaught exception, a payment webhook that couldn't be applied (see `PaymentsService`'s `markWebhookError`), a failed backup. |
++| `warn` | Recoverable but noteworthy — a rejected webhook signature, a 4xx-range access-log line, a rate limit triggered. |
++| `log`/`info` | Normal operation — the access log line, "server started," "migration completed." |
++| `debug` | Anything useful only when actively investigating something — `pino-http`'s full request/response metadata (deliberately pinned to `debug` regardless of the configured floor, so it never floods production logs by default but is one env var away when needed). |
++
++## What's deliberately NOT logged
++
++- Full request/response bodies — `pino-http` in this configuration logs
++  headers and metadata only, never the body. If body-logging is ever
++  turned on for debugging, the redaction list in `logger.module.ts` must
++  be extended *before* that change ships, not after — a DTO with a
++  `password` or `refreshToken` field would otherwise land in plaintext in
++  every log aggregator with access to these logs, which is typically a much
++  larger set of people than have database access.
++- Raw card data / full PAN — not something the application ever receives
++  in the first place (ARCA's hosted checkout page handles card entry;
++  see `SECURITY_REVIEW_VERIFIED.md`'s open item on `rawGatewayResponse`),
++  so there's nothing here to specifically scrub, but worth re-confirming
++  this stays true if the payment integration ever changes shape.
++- Full JWTs — logging middleware here works at the header level
++  (`Authorization` redacted wholesale), not by trying to selectively log
++  "everything except the token part" of a bearer header, which is a much
++  easier rule to get right than a parsing-based partial redaction.
++
++## Aggregation and retention
++
++Nothing in this repo ships logs anywhere — every container's logs go to
++its own stdout/stderr, captured by Docker's default `json-file` log driver
++and readable via `docker compose logs`. That's sufficient for a single-host
++deployment during initial launch, but doesn't survive a container being
++recreated (Docker's default driver has no built-in retention/shipping) and
++doesn't provide any cross-service search.
++
++**Before this goes to real production traffic, point Docker's logging at
++an aggregator** — this is an infrastructure choice this repo intentionally
++doesn't make for you (Loki + Grafana, CloudWatch Logs, Datadog, or
++anything else the team already operates), but concretely, whichever is
++chosen, do it via Docker's `logging:` driver config on each service in
++`docker-compose.yml` (e.g. the `loki` or `awslogs` driver) rather than
++adding a shipping agent inside each container — that keeps every
++container's job scoped to "run the app and log to stdout," which is the
++right boundary and is what the JSON-per-line format above was chosen to
++make trivial to consume however you plug it in.
++
++Whatever's chosen, set an explicit retention window (30 days is a common
++default for operational logs; longer if there's a compliance reason tied
++to the payment flow specifically) — "keep forever by default because no
++one configured otherwise" is how log storage costs quietly become a
++line item nobody remembers deciding on.
+diff --git a/docs/MIGRATION_STRATEGY.md b/docs/MIGRATION_STRATEGY.md
+new file mode 100644
+index 0000000..c69cf87
+--- /dev/null
++++ b/docs/MIGRATION_STRATEGY.md
+@@ -0,0 +1,140 @@
++# Migration strategy
++
++## Current state — read this first
++
++**`Admin_Panel_Backend/prisma/migrations/` does not exist.** The schema was
++developed against `schema.prisma` directly (almost certainly via `prisma db
++push` during iteration), never through `prisma migrate dev`. There is no
++migration history to deploy yet — `docker-compose.yml`'s `migrate` service
++will run `prisma migrate deploy` against an empty `migrations/` folder and
++succeed trivially, applying nothing, leaving the target database with no
++schema at all.
++
++**This has to be fixed once, by hand, before this stack is deployed
++anywhere for real** — and it can't be done from inside this review, because
++generating a correct baseline migration requires Prisma's own tooling
++running against a real (even if disposable/local) Postgres instance, and
++this sandbox cannot reach `binaries.prisma.sh` to fetch Prisma's engine
++binaries. Hand-writing the equivalent SQL is not an acceptable substitute —
++Prisma's exact DDL (constraint names, index names, enum creation order,
++default-value expressions) has to come from Prisma itself, or a
++hand-written migration risks silently drifting from what `schema.prisma`
++actually specifies, discovered only when `prisma migrate diff` (or a future
++`migrate dev`) reports unexpected drift against production.
++
++### One-time step, in an environment with real network access
++
++```bash
++cd Admin_Panel_Backend
++# Point at any disposable local/dev Postgres — never production.
++export DATABASE_URL="postgresql://praxis_app:devpassword@localhost:5432/praxis_dev?schema=public"
++export DIRECT_URL="$DATABASE_URL"
++
++npx prisma migrate dev --name init
++```
++
++This inspects the already-applied (via `db push`) schema against an empty
++migration history, generates `prisma/migrations/<timestamp>_init/`
++containing the full baseline DDL, and applies it to the dev database.
++**Commit the generated `prisma/migrations/` directory to git.** From that
++point on, `docker-compose.yml`'s `migrate` service will correctly apply it
++(and every migration after it) on every deploy.
++
++Run `prisma migrate dev` again, locally, every time `schema.prisma`
++changes from here forward — never edit `schema.prisma` and skip straight
++to `docker compose up` expecting the migrate service to figure it out;
++`migrate deploy` only ever applies migration files that already exist on
++disk, it never generates them.
++
++---
++
++## Ongoing strategy, once the baseline exists
++
++### The two Prisma commands, and why both exist
++- **`prisma migrate dev`** — local development only. Generates new
++  migration files by diffing `schema.prisma` against migration history,
++  applies them to your local database, and will prompt to reset the
++  database if it detects drift. Never run this against a shared or
++  production database — the reset-on-drift behavior is destructive.
++- **`prisma migrate deploy`** — the only command that should ever touch a
++  shared environment (staging, production). It never generates migrations,
++  never prompts, never resets. It applies whatever migration files already
++  exist in `prisma/migrations/`, in filename-timestamp order, and fails
++  loudly if the migration history in the target database's
++  `_prisma_migrations` table has diverged from what's on disk (e.g. a
++  migration file was edited after already being applied somewhere).
++
++`docker-compose.yml`'s `migrate` service runs the second one, exclusively.
++
++### Why migration application is a separate step from app startup
++`scripts/docker-migrate.sh` and the dedicated `migrate` compose service
++exist instead of running `prisma migrate deploy` inside the backend
++container's own boot sequence, for three concrete reasons:
++
++1. **One clear failure point.** If migration application were part of
++   every backend replica's startup, a failing migration would surface as N
++   crash-looping containers instead of one failed step a deploy pipeline
++   can gate on and alert about distinctly from "the app itself won't
++   boot."
++2. **No redundant concurrent attempts.** `migrate deploy` takes an
++   advisory lock and is safe to run concurrently, but there's no reason
++   for N replicas to all attempt it on every restart — one explicit run is
++   simpler to reason about and to read logs for.
++3. **Deploy ordering is explicit, not implicit.** `depends_on: migrate:
++   condition: service_completed_successfully` on the `backend` service
++   means Docker Compose itself enforces "schema must be up to date before
++   the app starts," rather than relying on the app's own code to detect
++   and tolerate a stale schema at request time.
++
++### Writing migrations safely — the expand/contract pattern
++A rolling or zero-downtime deploy means old and new application code can
++both be running against the database simultaneously for a short window.
++Two rules make that safe:
++
++- **Never remove or rename a column/table in the same migration that
++  removes the application code using it.** Old code (still running during
++  the deploy) will error on every request the instant the column
++  disappears. Split it into two deploys: (1) ship application code that
++  stops reading/writing the old column but the column still exists and is
++  still nullable/has a default, deploy, confirm it's healthy; (2) only
++  then ship a migration that drops the now-unused column, in a later
++  deploy.
++- **Adding a required (`NOT NULL`, no default) column is unsafe in one
++  step against a table with existing rows** — Postgres has to rewrite/
++  validate every row, and any concurrent write in the old code path that
++  doesn't set the new column fails immediately. Add it nullable (or with a
++  default) first, backfill, then tighten to `NOT NULL` in a later
++  migration once every row has a value and every code path sets it.
++
++This project's `prisma/constraints.sql` (CHECK constraints and triggers
++Prisma's schema language can't express — confirmed to exist, per the
++earlier security review) needs the same discipline: changes to it are
++still schema changes and belong in a migration, applied through the same
++`migrate deploy` step, not run ad hoc against production.
++
++### Rollback
++Prisma has no built-in automatic rollback — `migrate deploy` only ever
++moves forward. Two situations, two different correct responses:
++
++- **A migration fails partway through deploy** (e.g. a constraint
++  violation against existing data): the `migrate` service exits non-zero,
++  `backend`'s `depends_on` condition is never satisfied, and the deploy
++  stops with the *old* application version still running against the *old*
++  schema — nothing served traffic against a half-migrated database. Fix
++  the migration, commit a new one (never edit the failed one in place if
++  it partially applied), and redeploy.
++- **A migration succeeds but the resulting behavior is wrong** (a working
++  migration, a bad decision): write and deploy a new forward migration
++  that corrects it. Do not attempt to hand-edit `_prisma_migrations` or
++  delete an already-applied migration file to "undo" it — that desyncs the
++  migration history from what actually happened to the schema, which is
++  exactly the state `migrate deploy`'s drift detection exists to catch and
++  refuse to proceed past.
++
++### CI recommendation
++Run `prisma migrate deploy` against a disposable staging database as part
++of the deploy pipeline, before production — the same command, same
++migration files, same script (`scripts/docker-migrate.sh`), just pointed
++at a different `DATABASE_URL`/`DIRECT_URL`. This is what actually catches
++a migration problem before it reaches production, rather than discovering
++it live.
+diff --git a/ops/backup/Dockerfile b/ops/backup/Dockerfile
+new file mode 100644
+index 0000000..e2bfa87
+--- /dev/null
++++ b/ops/backup/Dockerfile
+@@ -0,0 +1,30 @@
++# syntax=docker/dockerfile:1
++
++# Alpine specifically for its postgresql-client package tracking recent
++# major versions closely, and because busybox's `crond` (included in the
++# base image already) is a small, well-understood scheduler — no reason to
++# pull in a full cron daemon or a third-party scheduling binary for one
++# nightly job.
++FROM alpine:3.20
++
++# postgresql17-client matches the postgres:17-alpine server image used in
++# docker-compose.yml — pg_dump's format is generally forward/backward
++# compatible across nearby major versions, but pinning the client to match
++# the server avoids ever having to think about it.
++RUN apk add --no-cache postgresql17-client bash
++
++RUN addgroup -g 1001 backup && adduser -D -u 1001 -G backup -s /bin/false backup
++
++WORKDIR /app
++COPY backup.sh entrypoint.sh ./
++RUN chmod +x backup.sh entrypoint.sh \
++  && mkdir -p /backups \
++  && chown -R backup:backup /app /backups
++
++# Deliberately stays root at the Dockerfile level: busybox crond needs to
++# write /etc/crontabs/root and, in this minimal image, that's the only
++# writable system crontab location. entrypoint.sh itself drops to the
++# unprivileged `backup` user for the actual pg_dump execution — see its
++# comments. This mirrors a common, narrowly-scoped exception, not a general
++# "run as root" choice for the service.
++ENTRYPOINT ["/app/entrypoint.sh"]
+diff --git a/ops/backup/backup.sh b/ops/backup/backup.sh
+new file mode 100644
+index 0000000..5e2116b
+--- /dev/null
++++ b/ops/backup/backup.sh
+@@ -0,0 +1,46 @@
++#!/bin/sh
++set -eu
++
++# -----------------------------------------------------------------------------
++# Takes one logical backup of the database and prunes backups older than
++# BACKUP_RETENTION_DAYS. See docs/BACKUP_STRATEGY.md for the full policy
++# (schedule, retention rationale, restore drill process, off-host copy).
++# -----------------------------------------------------------------------------
++
++BACKUP_DIR=/backups
++TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
++DEST="${BACKUP_DIR}/praxis_${TIMESTAMP}.dump"
++DEST_TMP="${DEST}.in-progress"
++
++echo "[backup] Starting: ${DEST}"
++
++# -Fc (custom format): compressed, and restorable selectively/in parallel
++# via pg_restore — unlike plain-SQL `pg_dump > file.sql`, this format also
++# lets a restore target a single table or skip data-vs-schema independently
++# without re-running the whole dump.
++#
++# Writes to a `.in-progress` temp name and atomically renames on success —
++# a backup that fails partway through (disk full, connection drop) must
++# never leave a truncated file sitting at the final name where a later
++# retention-pruning pass or a hurried restore could mistake it for a
++# complete, valid backup.
++if pg_dump --format=custom --no-owner --no-privileges --file="$DEST_TMP" "$DATABASE_URL"; then
++  mv "$DEST_TMP" "$DEST"
++  echo "[backup] Completed: ${DEST} ($(du -h "$DEST" | cut -f1))"
++else
++  status=$?
++  echo "[backup] FAILED (exit ${status}) — removing incomplete file." >&2
++  rm -f "$DEST_TMP"
++  exit "$status"
++fi
++
++# --- Retention: delete backups older than BACKUP_RETENTION_DAYS ------------
++# Deliberately scoped to this directory's own `praxis_*.dump` naming
++# pattern only — never a bare `find /backups -mtime ...` across the whole
++# directory, so an unrelated file someone drops in `/backups` for a manual
++# restore test is never silently swept up by the nightly prune.
++echo "[backup] Pruning backups older than ${BACKUP_RETENTION_DAYS} days."
++find "$BACKUP_DIR" -maxdepth 1 -type f -name 'praxis_*.dump' -mtime "+${BACKUP_RETENTION_DAYS}" -print -delete
++
++REMAINING=$(find "$BACKUP_DIR" -maxdepth 1 -type f -name 'praxis_*.dump' | wc -l)
++echo "[backup] Done. ${REMAINING} backup(s) currently retained."
+diff --git a/ops/backup/entrypoint.sh b/ops/backup/entrypoint.sh
+new file mode 100644
+index 0000000..b3b7136
+--- /dev/null
++++ b/ops/backup/entrypoint.sh
+@@ -0,0 +1,52 @@
++#!/bin/sh
++set -eu
++
++# -----------------------------------------------------------------------------
++# Renders a busybox crontab from BACKUP_SCHEDULE_CRON and runs the cron
++# daemon in the foreground (PID 1, so `docker stop` sends it SIGTERM
++# directly and container lifecycle/logging behave normally).
++#
++# WHY A GENERATED ENV FILE INSTEAD OF PUTTING SECRETS DIRECTLY IN THE
++# CRONTAB LINE: cron job definitions live in a file on disk
++# (/etc/crontabs/backup) that anyone with read access to the container's
++# filesystem can view — including via `docker exec cat`. Writing
++# DATABASE_URL (which contains the database password) into that file
++# directly means the secret exists in two places instead of one. Instead,
++# each scheduled run re-sources a single small env file that already has
++# restrictive permissions, and the crontab line itself contains no secret
++# material at all.
++# -----------------------------------------------------------------------------
++
++if [ -z "${DATABASE_URL:-}" ]; then
++  echo "[backup] FATAL: DATABASE_URL is not set." >&2
++  exit 1
++fi
++
++: "${BACKUP_RETENTION_DAYS:=14}"
++: "${BACKUP_SCHEDULE_CRON:=0 3 * * *}"
++
++ENV_FILE=/app/.backup-env
++{
++  echo "export DATABASE_URL='${DATABASE_URL}'"
++  echo "export BACKUP_RETENTION_DAYS='${BACKUP_RETENTION_DAYS}'"
++} > "$ENV_FILE"
++chmod 600 "$ENV_FILE"
++chown backup:backup "$ENV_FILE"
++
++CRONTAB_FILE=/etc/crontabs/backup
++mkdir -p /etc/crontabs
++echo "${BACKUP_SCHEDULE_CRON} . ${ENV_FILE} && /app/backup.sh >> /proc/1/fd/1 2>> /proc/1/fd/2" > "$CRONTAB_FILE"
++chmod 600 "$CRONTAB_FILE"
++
++echo "[backup] Scheduled: '${BACKUP_SCHEDULE_CRON}' (retention: ${BACKUP_RETENTION_DAYS} days)"
++echo "[backup] Running an initial backup now, then handing off to cron."
++# Runs one backup immediately at container start, in addition to the
++# schedule — otherwise a freshly deployed stack has zero backups until the
++# first scheduled time arrives, which could be up to 24h away.
++su -s /bin/sh backup -c ". ${ENV_FILE} && /app/backup.sh"
++
++# `-f`: foreground (required for this to be PID 1's long-running process).
++# `-d 8`: log at debug level to stderr, which lands in `docker logs` — cron
++# running silently with no visibility into whether jobs actually fired is a
++# common way backup failures go unnoticed for weeks.
++exec crond -f -d 8
+diff --git a/ops/backup/restore.sh b/ops/backup/restore.sh
+new file mode 100644
+index 0000000..6557944
+--- /dev/null
++++ b/ops/backup/restore.sh
+@@ -0,0 +1,67 @@
++#!/bin/sh
++set -eu
++
++# -----------------------------------------------------------------------------
++# Restores a backup produced by backup.sh. Deliberately manual-only — never
++# wired into any scheduled job or startup path. A restore is destructive
++# and must always be a deliberate, reviewed action by a person, taken
++# against a specific incident, never something that could fire
++# automatically from a misconfigured schedule.
++#
++# USAGE (run from inside the backup or postgres container, or anywhere
++# with network access to the target database and pg_restore installed):
++#   ./restore.sh /backups/praxis_20260817T030000Z.dump postgresql://user:pass@host:5432/dbname
++#
++# This restores into the database named in the target URL AS-IS — it does
++# not create a new database for you and does not ask for confirmation
++# beyond the explicit prompt below. Point this at a scratch/staging
++# database to verify a backup, never directly at production, unless
++# production recovery is exactly the intent right now.
++# -----------------------------------------------------------------------------
++
++BACKUP_FILE="${1:-}"
++TARGET_URL="${2:-}"
++
++if [ -z "$BACKUP_FILE" ] || [ -z "$TARGET_URL" ]; then
++  echo "Usage: $0 <backup-file.dump> <postgresql-target-url>" >&2
++  exit 1
++fi
++
++if [ ! -f "$BACKUP_FILE" ]; then
++  echo "FATAL: backup file not found: ${BACKUP_FILE}" >&2
++  exit 1
++fi
++
++REDACTED_TARGET=$(echo "$TARGET_URL" | sed -E 's#(://[^:]+:)[^@]+(@)#\1***\2#')
++echo "About to restore:"
++echo "  Source: ${BACKUP_FILE}"
++echo "  Target: ${REDACTED_TARGET}"
++echo
++echo "This will run pg_restore with --clean, which DROPS existing objects in"
++echo "the target database before recreating them from the backup. Any data"
++echo "in the target database that is not in this backup will be lost."
++echo
++printf "Type the target database name to confirm: "
++read -r CONFIRM_NAME
++
++TARGET_DB_NAME=$(echo "$TARGET_URL" | sed -E 's#.*/([^/?]+)(\?.*)?$#\1#')
++if [ "$CONFIRM_NAME" != "$TARGET_DB_NAME" ]; then
++  echo "Confirmation did not match database name '${TARGET_DB_NAME}' — aborting." >&2
++  exit 1
++fi
++
++echo "[restore] Starting pg_restore..."
++# --clean --if-exists: drop existing objects first (idempotent — safe to
++# run against a database that already has the old schema/data in it, not
++# just an empty one). --no-owner/--no-privileges: matches backup.sh's
++# dump flags, so ownership/grants from the source environment don't leak
++# into and conflict with the target environment's own role setup.
++pg_restore \
++  --clean \
++  --if-exists \
++  --no-owner \
++  --no-privileges \
++  --dbname="$TARGET_URL" \
++  "$BACKUP_FILE"
++
++echo "[restore] Completed. Verify application behavior against this database before directing production traffic at it."

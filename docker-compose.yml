@@ -1,0 +1,227 @@
+# -----------------------------------------------------------------------------
+# Production compose for PraxisTechAcademy.
+#
+# Scope note: this targets Admin_Panel_Backend/ and Frontend/praxis-web/,
+# confirmed (see SECURITY_REVIEW_VERIFIED.md) as the most complete,
+# cumulative snapshots of the backend and frontend respectively, out of the
+# repo's several overlapping project folders. If a different folder is
+# actually the deployment target, update the two `build.context` paths
+# below — nothing else in this file depends on which folder it is.
+#
+# This is a single-host compose deployment (one Postgres instance, one
+# backend replica, one frontend replica) — the right shape for a first
+# production launch. See docs/DEPLOYMENT.md for what changes if/when this
+# needs to scale beyond one host (backend is already stateless/horizontally
+# scalable as written; Postgres is not, without adding a managed
+# replica/failover setup that's out of scope for a docker-compose file).
+#
+# USAGE:
+#   cp .env.example .env        # then fill in every CHANGE_ME value
+#   docker compose build
+#   docker compose up -d
+#   docker compose logs -f backend frontend
+# -----------------------------------------------------------------------------
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      # Matches Prisma's default schema.prisma encoding assumption and
+      # avoids the well-known "sorts/compares differently than expected"
+      # class of bugs that comes from an unset/inherited-from-OS locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
+    # No `ports:` mapping to the host — Postgres is only reachable from
+    # other containers on the `internal` network below. Exposing 5432 to
+    # the host is a common way a database that was only ever meant to be
+    # reached by the app ends up reachable from the public internet the
+    # moment the host's firewall config drifts.
+    networks:
+      - internal
+    volumes:
+      - praxis_postgres_data:/var/lib/postgresql/data
+      # Mounted into the backup service too (see below) — pg_dump reads
+      # the live cluster over the Postgres wire protocol, not this volume
+      # directly, but co-locating them keeps the backup script's target
+      # directory on the same host filesystem for straightforward off-host
+      # syncing (rclone/rsync/aws s3 sync) by a cron job outside this
+      # compose file.
+      - praxis_postgres_backups:/backups
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  # One-shot migration runner. Applies any pending Prisma migrations and
+  # exits — `backend` waits on this succeeding before it starts (see
+  # `depends_on` below), so a failed migration blocks the deploy instead of
+  # the app starting up against a schema it doesn't match. See
+  # docs/MIGRATION_STRATEGY.md for why this is a separate service rather
+  # than baked into the backend container's own startup.
+  migrate:
+    build:
+      context: ./Admin_Panel_Backend
+      dockerfile: Dockerfile
+    restart: "no"
+    command: ["sh", "scripts/docker-migrate.sh"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      DIRECT_URL: ${DIRECT_URL}
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  backend:
+    build:
+      context: ./Admin_Panel_Backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      CORS_ORIGIN: ${CORS_ORIGIN}
+      LOG_LEVEL: ${LOG_LEVEL}
+      DATABASE_URL: ${DATABASE_URL}
+      DIRECT_URL: ${DIRECT_URL}
+      THROTTLE_TTL_MS: ${THROTTLE_TTL_MS}
+      THROTTLE_LIMIT: ${THROTTLE_LIMIT}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_ACCESS_EXPIRES_IN: ${JWT_ACCESS_EXPIRES_IN}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      JWT_REFRESH_EXPIRES_IN: ${JWT_REFRESH_EXPIRES_IN}
+      BCRYPT_SALT_ROUNDS: ${BCRYPT_SALT_ROUNDS}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN}
+      ARCA_API_BASE_URL: ${ARCA_API_BASE_URL}
+      ARCA_MERCHANT_LOGIN: ${ARCA_MERCHANT_LOGIN}
+      ARCA_MERCHANT_PASSWORD: ${ARCA_MERCHANT_PASSWORD}
+      ARCA_WEBHOOK_SECRET: ${ARCA_WEBHOOK_SECRET}
+      ARCA_RETURN_URL: ${ARCA_RETURN_URL}
+      ARCA_REQUEST_TIMEOUT_MS: ${ARCA_REQUEST_TIMEOUT_MS}
+      ORDER_EXPIRY_MINUTES: ${ORDER_EXPIRY_MINUTES}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_BOT_USERNAME: ${TELEGRAM_BOT_USERNAME}
+      TELEGRAM_API_BASE_URL: ${TELEGRAM_API_BASE_URL}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
+      TELEGRAM_REQUEST_TIMEOUT_MS: ${TELEGRAM_REQUEST_TIMEOUT_MS}
+      TELEGRAM_INVITE_LINK_EXPIRY_MINUTES: ${TELEGRAM_INVITE_LINK_EXPIRY_MINUTES}
+    networks:
+      - internal
+      - edge
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:3000/health/live',(r)=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  frontend:
+    build:
+      context: ./Frontend/praxis-web
+      dockerfile: Dockerfile
+      args:
+        # Baked into the client bundle at build time — see the Dockerfile
+        # comment on why this can't be a normal runtime environment
+        # variable the way every backend variable above is.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    restart: unless-stopped
+    networks:
+      - edge
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:3000/api/health',(r)=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # Reverse proxy / TLS termination is deliberately NOT included here — see
+  # docs/DEPLOYMENT.md. Terminating TLS correctly (cert issuance/renewal,
+  # HSTS, the ACME HTTP-01 challenge path) is enough of its own concern
+  # that it belongs in whatever this is actually deployed behind (a
+  # managed load balancer, or an explicitly-versioned Caddy/Traefik/nginx
+  # config tracked separately) rather than a minimal inline service here
+  # that would be the first thing anyone reflexively deletes or forgets to
+  # harden.
+
+  # Nightly logical backup. Runs pg_dump on a schedule inside the container
+  # (no host cron dependency) and prunes old backups per
+  # BACKUP_RETENTION_DAYS. See docs/BACKUP_STRATEGY.md for the full
+  # strategy, restore drill process, and off-host replication
+  # recommendation (this alone protects against data corruption/accidental
+  # deletion, NOT against total host loss, unless BACKUP_REMOTE_SYNC is
+  # also configured to ship these off-host).
+  backup:
+    build:
+      context: ./ops/backup
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-14}
+      BACKUP_SCHEDULE_CRON: ${BACKUP_SCHEDULE_CRON:-0 3 * * *}
+    networks:
+      - internal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - praxis_postgres_backups:/backups
+
+networks:
+  # Postgres and the migration/backup jobs live only here — never reachable
+  # from outside the Docker host, and not reachable from `frontend` either
+  # (it has no reason to talk to the database directly).
+  internal:
+  # backend and frontend share this network so the reverse proxy in front
+  # of the host can reach both; postgres is deliberately not attached to it.
+  edge:
+
+volumes:
+  praxis_postgres_data:
+  praxis_postgres_backups:
