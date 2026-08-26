@@ -60,34 +60,52 @@ export const envValidationSchema = Joi.object({
   // admin password just to start the API).
 
   // --- Payments (ARCA) ----------------------------------------------------
-  // No defaults for any of these — a payment integration must never fall
-  // back to a placeholder credential. Every one of these must be supplied
-  // by the specific issuing bank's merchant onboarding process; see
-  // ArcaPaymentProvider for the parts of the integration that still need
-  // confirming against that bank's actual API documentation.
-  ARCA_API_BASE_URL: Joi.string().uri().required(),
-  ARCA_MERCHANT_LOGIN: Joi.string().min(1).required(),
-  ARCA_MERCHANT_PASSWORD: Joi.string().min(1).required(),
+  // Required in production — a payment integration must never fall back to
+  // a placeholder credential.  Optional in development/test so the backend
+  // boots for local dev without real bank credentials (payment-related
+  // endpoints will still error if called, which is the right behaviour).
+  ARCA_API_BASE_URL: Joi.string()
+    .uri()
+    .when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.optional() }),
+  ARCA_MERCHANT_LOGIN: Joi.string()
+    .min(1)
+    .when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.optional() }),
+  ARCA_MERCHANT_PASSWORD: Joi.string()
+    .min(1)
+    .when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.optional() }),
   // Shared secret for verifying the authenticity of inbound ARCA webhook
   // callbacks (HMAC). Minimum length enforced so a trivial/guessable
   // secret can't silently make it into production.
-  ARCA_WEBHOOK_SECRET: Joi.string().min(32).required(),
+  ARCA_WEBHOOK_SECRET: Joi.string()
+    .min(32)
+    .when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.optional() }),
   // Where the student's browser is redirected after leaving ARCA's hosted
   // payment page — the frontend's own landing route, not this API.
-  ARCA_RETURN_URL: Joi.string().uri().required(),
+  ARCA_RETURN_URL: Joi.string()
+    .uri()
+    .when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.optional() }),
   ARCA_REQUEST_TIMEOUT_MS: Joi.number().integer().positive().default(15000),
   // How long an unpaid Order remains payable before it's considered
   // expired and must be recreated.
   ORDER_EXPIRY_MINUTES: Joi.number().integer().positive().default(30),
 
   // --- Telegram -----------------------------------------------------------
-  TELEGRAM_BOT_TOKEN: Joi.string().min(1).required(),
-  TELEGRAM_BOT_USERNAME: Joi.string().min(1).required(), // no leading "@" — used to build https://t.me/<username>?start=<token> deep links
+  // Required in production; optional in development/test for the same
+  // reason as ARCA — Telegram bot features simply won't work in local dev
+  // without a real token, but the rest of the app should still boot.
+  TELEGRAM_BOT_TOKEN: Joi.string()
+    .min(1)
+    .when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.optional() }),
+  TELEGRAM_BOT_USERNAME: Joi.string()
+    .min(1)
+    .when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.optional() }), // no leading "@" — used to build https://t.me/<username>?start=<token> deep links
   TELEGRAM_API_BASE_URL: Joi.string().uri().default('https://api.telegram.org'),
   // Shared secret Telegram echoes back in the `X-Telegram-Bot-Api-Secret-Token`
   // header on every webhook request (set via setWebhook's secret_token param
   // during bot setup) — see TelegramWebhookController for how this is verified.
-  TELEGRAM_WEBHOOK_SECRET: Joi.string().min(32).required(),
+  TELEGRAM_WEBHOOK_SECRET: Joi.string()
+    .min(32)
+    .when('NODE_ENV', { is: 'production', then: Joi.required(), otherwise: Joi.optional() }),
   TELEGRAM_REQUEST_TIMEOUT_MS: Joi.number().integer().positive().default(10000),
   // How long a single-use invite link stays valid before a student must
   // request a new one.

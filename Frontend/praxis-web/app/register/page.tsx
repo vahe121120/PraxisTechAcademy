@@ -77,7 +77,7 @@ function RegisterForm() {
               label="Password"
               type="password"
               autoComplete="new-password"
-              hint="At least 10 characters, with upper/lowercase, a number, and a symbol."
+              hint="At least 12 characters, with upper/lowercase, a number, and a symbol."
               error={errors.password?.message}
               {...register("password")}
             />

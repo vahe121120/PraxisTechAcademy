@@ -1,12 +1,7 @@
 import type { ApiErrorBody } from "@/lib/types";
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL;
-
-if (!API_URL && typeof window !== "undefined") {
-  // Fail loud in the browser rather than silently hitting a relative path
-  // that happens to 404 in a confusing way.
-  console.error("NEXT_PUBLIC_API_URL is not set.");
-}
+const RAW_API_URL = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:3000").replace(/\/$/, "");
+const API_URL = RAW_API_URL.endsWith("/api/v1") ? RAW_API_URL : `${RAW_API_URL}/api/v1`;
 
 export class ApiError extends Error {
   readonly statusCode: number;

@@ -6,7 +6,7 @@ import { isValidPhoneNumber } from "libphonenumber-js";
 // the client didn't know about.
 const passwordSchema = z
   .string()
-  .min(10, "Password must be at least 10 characters")
+  .min(12, "Password must be at least 12 characters")
   .max(128, "Password is too long")
   .regex(/[a-z]/, "Password must include a lowercase letter")
   .regex(/[A-Z]/, "Password must include an uppercase letter")

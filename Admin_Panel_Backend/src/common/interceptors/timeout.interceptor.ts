@@ -3,6 +3,7 @@ import {
   ExecutionContext,
   Injectable,
   NestInterceptor,
+  Optional,
   RequestTimeoutException,
 } from '@nestjs/common';
 import { Observable, TimeoutError, throwError } from 'rxjs';
@@ -19,7 +20,7 @@ const DEFAULT_TIMEOUT_MS = 15_000;
  */
 @Injectable()
 export class TimeoutInterceptor implements NestInterceptor {
-  constructor(private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS) {}
+  constructor(@Optional() private readonly timeoutMs: number = DEFAULT_TIMEOUT_MS) {}
 
   intercept(_context: ExecutionContext, next: CallHandler): Observable<unknown> {
     return next.handle().pipe(

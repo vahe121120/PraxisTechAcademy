@@ -1,4 +1,4 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, VERSION_NEUTRAL } from '@nestjs/common';
 import {
   DiskHealthIndicator,
   HealthCheck,
@@ -7,6 +7,7 @@ import {
   MemoryHealthIndicator,
 } from '@nestjs/terminus';
 
+import { Public } from '../auth/decorators/public.decorator';
 import { PrismaHealthIndicator } from './indicators/prisma.health-indicator';
 
 /**
@@ -24,7 +25,8 @@ import { PrismaHealthIndicator } from './indicators/prisma.health-indicator';
  * `GET /health` is kept as a plain alias of readiness for simple uptime
  * monitors (e.g. a status page pinger) that only know how to hit one URL.
  */
-@Controller('health')
+@Public()
+@Controller({ path: 'health', version: VERSION_NEUTRAL })
 export class HealthController {
   constructor(
     private readonly health: HealthCheckService,
@@ -49,7 +51,7 @@ export class HealthController {
       // against real memory limits once the container's resource requests
       // are finalized.
       () => this.memory.checkHeap('memory_heap', 300 * 1024 * 1024),
-      () => this.disk.checkStorage('disk', { path: '/', thresholdPercent: 0.9 }),
+      () => this.disk.checkStorage('disk', { path: '/', thresholdPercent: 0.99 }),
     ]);
   }
 

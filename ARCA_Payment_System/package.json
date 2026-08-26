@@ -1,5 +1,5 @@
 {
-  "name": "@praxis/api",
+  "name": "@praxis/arca-payment",
   "version": "0.1.0",
   "description": "Praxis Tech Academy — payment and student management API",
   "private": true,

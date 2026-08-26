@@ -1,0 +1,30 @@
+{
+  "name": "praxis-tech-academy",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Praxis Tech Academy monorepo workspace",
+  "workspaces": [
+    "Admin_Panel_Backend",
+    "Frontend/praxis-web",
+    "ARCA_Payment_System",
+    "Authentication_System",
+    "Backend_Initialization",
+    "Course_Groups",
+    "Course_Management",
+    "Payment_Telegram_Automation",
+    "Subscription_System",
+    "Telegram_Bot_integration"
+  ],
+  "scripts": {
+    "dev:backend": "npm --prefix Admin_Panel_Backend run start:dev",
+    "dev:frontend": "npm --prefix Frontend/praxis-web run dev",
+    "build:backend": "npm --prefix Admin_Panel_Backend run build",
+    "build:frontend": "npm --prefix Frontend/praxis-web run build",
+    "build": "npm run build:backend && npm run build:frontend",
+    "test:backend": "npm --prefix Admin_Panel_Backend run test",
+    "typecheck:frontend": "npm --prefix Frontend/praxis-web run typecheck",
+    "prisma:generate": "npm --prefix Admin_Panel_Backend run prisma:generate",
+    "prisma:migrate": "npm --prefix Admin_Panel_Backend run prisma:migrate:dev",
+    "prisma:studio": "npm --prefix Admin_Panel_Backend run prisma:studio"
+  }
+}

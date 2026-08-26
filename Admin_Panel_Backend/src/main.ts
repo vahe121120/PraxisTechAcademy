@@ -4,8 +4,6 @@ import type { NestExpressApplication } from '@nestjs/platform-express';
 import compression from 'compression';
 import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
-
-import './types/express';
 import { AppModule } from './app.module';
 import { AppConfigService } from './config/app-config.service';
 

@@ -8,8 +8,14 @@ import { IsTelegramUsername } from '../../common/validators/is-telegram-username
 export class RegisterDto {
   @IsString()
   @Length(2, 150, { message: 'name must be between 2 and 150 characters' })
-  @Transform(({ value }: { value: string }) => value?.trim())
+  @Transform(({ value, obj }: { value?: string; obj?: { name?: string; fullName?: string } }) =>
+    (value ?? obj?.fullName)?.trim(),
+  )
   name!: string;
+
+  @IsOptional()
+  @IsString()
+  fullName?: string;
 
   @IsEmail({}, { message: 'email must be a valid email address' })
   @Transform(({ value }: { value: string }) => normalizeEmail(value))

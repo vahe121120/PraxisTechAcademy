@@ -1,0 +1,35 @@
+# =============================================================================
+# docker-compose.override.yml — LOCAL DEVELOPMENT overrides
+#
+# Docker Compose automatically merges this with docker-compose.yml.
+# This file is NOT committed to production deployments — it exists only to
+# make local `docker compose up` work out of the box without touching the
+# production compose file.
+#
+# What this adds:
+#   - Host port mappings so you can reach Postgres, backend, and frontend
+#     from your local machine (psql, curl, browser).
+#   - NODE_ENV=development on the backend.
+#   - The backup service is disabled locally (profiles trick) — it's a
+#     production-only concern and would just waste resources + log noise.
+# =============================================================================
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  backend:
+    environment:
+      NODE_ENV: development
+    ports:
+      - "3000:3000"
+
+  frontend:
+    ports:
+      - "3001:3000"
+
+  # Disable the backup service for local development.
+  backup:
+    profiles:
+      - prod-only

@@ -4,8 +4,10 @@ import type { SafeUser, TokenPair } from "@/lib/types";
 export interface RegisterPayload {
   email: string;
   password: string;
-  fullName: string;
+  fullName?: string;
+  name?: string;
   phone: string;
+  telegramUsername?: string;
 }
 
 export interface LoginPayload {
@@ -22,7 +24,14 @@ export interface AuthResult extends TokenPair {
 // `credentials: "include"` (the http.ts default) is what carries it.
 
 export function register(payload: RegisterPayload) {
-  return request<AuthResult>("/auth/register", { method: "POST", body: payload });
+  const { fullName, name, ...rest } = payload;
+  return request<AuthResult>("/auth/register", {
+    method: "POST",
+    body: {
+      ...rest,
+      name: (name ?? fullName)?.trim(),
+    },
+  });
 }
 
 export function login(payload: LoginPayload) {
