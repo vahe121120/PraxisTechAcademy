@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { Users, CreditCard, TrendingUp, Clock } from "lucide-react";
+import { Users, CreditCard, TrendingUp, ShieldOff } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { getDashboardStats } from "@/lib/api/admin";
 import { ApiError } from "@/lib/api/http";
@@ -23,15 +23,32 @@ export function AdminContent() {
   // shows a "Suspended" badge) reflects the change without a full remount.
   const [listRefreshKey, setListRefreshKey] = useState(0);
 
-  useEffect(() => {
+  const loadStats = useCallback(() => {
+    setStatsError(null);
     callWithAuth((token) => getDashboardStats(token))
       .then(setStats)
       .catch((err) => setStatsError(err instanceof ApiError ? err.message : "Couldn't load stats."));
   }, [callWithAuth]);
 
+  useEffect(() => {
+    // Sanctioned "fetch from an external system on mount" pattern.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadStats();
+  }, [loadStats]);
+
   const handleStudentChanged = useCallback(() => {
     setListRefreshKey((k) => k + 1);
   }, []);
+
+  // Revenue is reported per-currency (see DashboardStats.monthlyRevenue) —
+  // the business operates in a single currency in practice, but the stat
+  // card renders whatever the API actually returns rather than assuming a
+  // single number/currency pair.
+  const revenueLabel = stats
+    ? stats.monthlyRevenue.length === 0
+      ? formatMoney(0, "AMD")
+      : stats.monthlyRevenue.map((r) => formatMoney(r.amount, r.currency)).join(" / ")
+    : "";
 
   return (
     <div className="flex flex-col gap-8">
@@ -41,7 +58,7 @@ export function AdminContent() {
       </div>
 
       {statsError ? (
-        <ErrorState message={statsError} />
+        <ErrorState message={statsError} onRetry={loadStats} />
       ) : !stats ? (
         <div className="flex justify-center py-6">
           <Spinner className="h-5 w-5 text-brand-500" />
@@ -54,12 +71,12 @@ export function AdminContent() {
             value={stats.activeSubscriptions.toLocaleString()}
             icon={TrendingUp}
           />
-          <StatCard label="Pending orders" value={stats.pendingOrders.toLocaleString()} icon={Clock} />
           <StatCard
-            label="Revenue this month"
-            value={formatMoney(stats.revenueMinorThisMonth, stats.currency)}
-            icon={CreditCard}
+            label="Expired subscriptions"
+            value={stats.expiredSubscriptions.toLocaleString()}
+            icon={ShieldOff}
           />
+          <StatCard label="Revenue this month" value={revenueLabel} icon={CreditCard} />
         </div>
       )}
 

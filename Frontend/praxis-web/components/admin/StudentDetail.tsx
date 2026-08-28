@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { ShieldOff, ShieldCheck, Mail, Phone, Send } from "lucide-react";
+import { ShieldOff, ShieldCheck, Mail, Phone } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import {
   getStudent,
@@ -48,12 +48,15 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
     try {
       const [studentResult, paymentsResult, subscriptionsResult] = await Promise.all([
         callWithAuth((token) => getStudent(studentId, token)),
-        callWithAuth((token) => getStudentPayments(studentId, token)),
-        callWithAuth((token) => getStudentSubscriptions(studentId, token)),
+        // Both admin sub-resources are paginated — take the first page at a
+        // generous limit rather than the default 20, since this panel has
+        // no pagination controls of its own yet.
+        callWithAuth((token) => getStudentPayments(studentId, token, { limit: 100 })),
+        callWithAuth((token) => getStudentSubscriptions(studentId, token, { limit: 100 })),
       ]);
       setStudent(studentResult);
-      setPayments(paymentsResult);
-      setSubscriptions(subscriptionsResult);
+      setPayments(paymentsResult.data);
+      setSubscriptions(subscriptionsResult.data);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Couldn't load this student.");
     } finally {
@@ -76,7 +79,8 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
     setMutationError(null);
     setIsMutating(true);
     try {
-      const updated = student.isSuspended
+      const isSuspended = student.status === "SUSPENDED";
+      const updated = isSuspended
         ? await callWithAuth((token) => reactivateStudent(student.id, token))
         : await callWithAuth((token) => suspendStudent(student.id, token));
       setStudent(updated);
@@ -109,19 +113,16 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
   if (error) return <ErrorState message={error} onRetry={load} />;
   if (!student) return null;
 
+  const isSuspended = student.status === "SUSPENDED";
+
   return (
     <div className="flex flex-col gap-4">
       <Card>
         <CardHeader className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <div className="flex items-center gap-2">
-              <h2 className="text-lg font-semibold text-ink-900-solid">{student.fullName}</h2>
-              {student.isSuspended && <Badge tone="danger">Suspended</Badge>}
-              {student.telegramLinked && (
-                <span title="Telegram linked">
-                  <Send className="h-4 w-4 text-signal-500" aria-hidden="true" />
-                </span>
-              )}
+              <h2 className="text-lg font-semibold text-ink-900-solid">{student.name}</h2>
+              {isSuspended && <Badge tone="danger">Suspended</Badge>}
             </div>
             <div className="mt-1 flex flex-col gap-1 text-sm text-ink-500 sm:flex-row sm:gap-4">
               <span className="flex items-center gap-1.5">
@@ -140,12 +141,12 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
 
           {!confirmingSuspend ? (
             <Button
-              variant={student.isSuspended ? "secondary" : "danger"}
+              variant={isSuspended ? "secondary" : "danger"}
               size="sm"
-              onClick={() => (student.isSuspended ? handleSuspendToggle() : setConfirmingSuspend(true))}
+              onClick={() => (isSuspended ? handleSuspendToggle() : setConfirmingSuspend(true))}
               isLoading={isMutating && !confirmingSuspend}
             >
-              {student.isSuspended ? (
+              {isSuspended ? (
                 <>
                   <ShieldCheck className="h-4 w-4" aria-hidden="true" />
                   Reactivate
@@ -199,7 +200,7 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
                       {sub.courseTitle ?? sub.courseId} — {sub.courseGroupTitle ?? sub.courseGroupId}
                     </p>
                     <p className="text-sm text-ink-500">
-                      {sub.expiresAt ? `Expires ${formatDate(sub.expiresAt)}` : "No expiry set"}
+                      {sub.expireDate ? `Expires ${formatDate(sub.expireDate)}` : "No expiry set"}
                     </p>
                   </div>
                   <div className="flex items-center gap-3">
@@ -236,9 +237,11 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
             <tbody className="divide-y divide-ink-100">
               {payments.map((payment) => (
                 <tr key={payment.id}>
-                  <td className="px-4 py-2.5 text-ink-500">{formatDateTime(payment.createdAt)}</td>
+                  <td className="px-4 py-2.5 text-ink-500">{formatDateTime(payment.initiatedAt)}</td>
                   <td className="px-4 py-2.5 font-medium text-ink-900-solid">
-                    {formatMoney(payment.amountMinor, payment.currency)}
+                    {payment.amount !== undefined && payment.currency
+                      ? formatMoney(payment.amount, payment.currency)
+                      : "—"}
                   </td>
                   <td className="px-4 py-2.5 text-ink-500">{payment.provider}</td>
                   <td className="px-4 py-2.5">

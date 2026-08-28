@@ -52,11 +52,11 @@ export function StudentSearch({ selectedId, onSelect, refreshKey }: StudentSearc
     setIsLoading(true);
     setError(null);
 
-    callWithAuth((token) => searchStudents({ query: query || undefined, page, pageSize: PAGE_SIZE }, token))
+    callWithAuth((token) => searchStudents({ search: query || undefined, page, limit: PAGE_SIZE }, token))
       .then((result) => {
         if (cancelled) return;
-        setResults(result.items);
-        setTotal(result.total);
+        setResults(result.data);
+        setTotal(result.meta.total);
       })
       .catch((err) => {
         if (cancelled) return;
@@ -116,10 +116,10 @@ export function StudentSearch({ selectedId, onSelect, refreshKey }: StudentSearc
                   }`}
                 >
                   <div className="min-w-0">
-                    <p className="truncate font-medium text-ink-900-solid">{student.fullName}</p>
+                    <p className="truncate font-medium text-ink-900-solid">{student.name}</p>
                     <p className="truncate text-sm text-ink-500">{student.email}</p>
                   </div>
-                  {student.isSuspended && <Badge tone="danger">Suspended</Badge>}
+                  {student.status === "SUSPENDED" && <Badge tone="danger">Suspended</Badge>}
                 </button>
               </li>
             ))}

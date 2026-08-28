@@ -23,6 +23,7 @@ import { OrdersService } from '../orders/orders.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { TELEGRAM_ACCESS_PORT, TelegramAccessPort } from '../telegram/telegram-access.port';
 import { SafeUser } from '../users/interfaces/safe-user.interface';
+import { PaymentResponse, toPaymentResponse } from './interfaces/payment-response.interface';
 import { PaymentGatewayError } from './providers/payment-gateway.error';
 import {
   PaymentProvider,
@@ -147,21 +148,33 @@ export class PaymentsService {
    * (see the schema comment on Order for why) — it's reached via
    * `Payment.order.userId`.
    */
-  async findByUser(userId: string, page = 1, limit = 20): Promise<PaginatedResult<Payment>> {
+  async findByUser(
+    userId: string,
+    page = 1,
+    limit = 20,
+  ): Promise<PaginatedResult<PaymentResponse>> {
     const where: Prisma.PaymentWhereInput = { order: { userId } };
     const skip = (page - 1) * limit;
 
-    const [data, total] = await Promise.all([
+    const [rows, total] = await Promise.all([
       this.prisma.payment.findMany({
         where,
         skip,
         take: limit,
         orderBy: { initiatedAt: 'desc' },
+        // Amount/currency live on Order, not Payment (see the schema
+        // comment on Payment) — joined here so an admin reviewing a
+        // student's payment history sees how much each attempt was for
+        // without an extra round trip per row.
+        include: { order: { select: { amount: true, currency: true } } },
       }),
       this.prisma.payment.count({ where }),
     ]);
 
-    return { data, meta: { page, limit, total, totalPages: Math.ceil(total / limit) } };
+    return {
+      data: rows.map(toPaymentResponse),
+      meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    };
   }
 
   // ---------------------------------------------------------------------

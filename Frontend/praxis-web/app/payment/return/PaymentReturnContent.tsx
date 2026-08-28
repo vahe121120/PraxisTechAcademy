@@ -42,12 +42,20 @@ export function PaymentReturnContent() {
         const result = await callWithAuth((token) => getPaymentStatus(orderId!, token));
         if (cancelled) return;
 
-        if (result.orderStatus === "PAID") {
+        if (result.order.status === "PAID") {
           sessionStorage.removeItem("praxis:pendingOrderId");
           setState("paid");
           return;
         }
-        if (result.orderStatus === "FAILED" || result.orderStatus === "CANCELLED") {
+        // OrderStatus itself has no FAILED value — a failed attempt leaves
+        // the Order PENDING (still retryable) unless it also expired or was
+        // cancelled outright. A FAILED latest payment on a still-PENDING
+        // order means this specific attempt didn't go through.
+        if (
+          result.order.status === "EXPIRED" ||
+          result.order.status === "CANCELLED" ||
+          result.latestPayment?.status === "FAILED"
+        ) {
           setState("failed");
           return;
         }

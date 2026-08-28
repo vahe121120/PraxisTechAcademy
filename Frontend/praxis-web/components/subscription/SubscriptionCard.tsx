@@ -6,6 +6,7 @@ import { StatusBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { useAuth } from "@/context/AuthContext";
 import { renewSubscription, cancelSubscription } from "@/lib/api/subscriptions";
+import { initiatePayment } from "@/lib/api/payments";
 import { ApiError } from "@/lib/api/http";
 import { formatDate } from "@/lib/money";
 import type { Subscription } from "@/lib/types";
@@ -20,19 +21,35 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
   const [pendingAction, setPendingAction] = useState<"renew" | "cancel" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  async function handleAction(action: "renew" | "cancel") {
+  async function handleCancel() {
     setError(null);
-    setPendingAction(action);
+    setPendingAction("cancel");
     try {
-      const updated = await callWithAuth((token) =>
-        action === "renew"
-          ? renewSubscription(subscription.id, token)
-          : cancelSubscription(subscription.id, token),
-      );
+      const updated = await callWithAuth((token) => cancelSubscription(subscription.id, token));
       onChange(updated);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "That didn't go through. Try again.");
     } finally {
+      setPendingAction(null);
+    }
+  }
+
+  async function handleRenew() {
+    setError(null);
+    setPendingAction("renew");
+    try {
+      // Renewing creates a new payable Order, exactly like a fresh
+      // enrollment — it does not instantly flip the subscription back to
+      // ACTIVE. The student has to complete payment first, same as
+      // PurchaseButton's flow.
+      const order = await callWithAuth((token) => renewSubscription(subscription.id, token));
+      const { paymentUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
+      sessionStorage.setItem("praxis:pendingOrderId", order.id);
+      window.location.href = paymentUrl;
+    } catch (err) {
+      setError(
+        err instanceof ApiError ? err.message : "Couldn't start renewal. Please try again.",
+      );
       setPendingAction(null);
     }
   }
@@ -52,10 +69,10 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
           </div>
           <StatusBadge status={subscription.status} />
         </div>
-        {subscription.expiresAt && (
+        {subscription.expireDate && (
           <p className="text-sm text-ink-500">
             {subscription.status === "ACTIVE" ? "Renews" : "Expired"} on{" "}
-            {formatDate(subscription.expiresAt)}
+            {formatDate(subscription.expireDate)}
           </p>
         )}
         {error && (
@@ -71,7 +88,7 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
                 variant="secondary"
                 isLoading={pendingAction === "renew"}
                 disabled={pendingAction !== null}
-                onClick={() => handleAction("renew")}
+                onClick={handleRenew}
               >
                 Renew
               </Button>
@@ -82,7 +99,7 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
                 variant="ghost"
                 isLoading={pendingAction === "cancel"}
                 disabled={pendingAction !== null}
-                onClick={() => handleAction("cancel")}
+                onClick={handleCancel}
               >
                 Cancel
               </Button>

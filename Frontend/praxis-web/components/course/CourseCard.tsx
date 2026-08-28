@@ -18,14 +18,14 @@ export function CourseCard({ course }: { course: Course }) {
             />
           </div>
           <h3 className="text-lg font-semibold text-ink-900-solid">{course.title}</h3>
-          <p className="line-clamp-2 flex-1 text-sm text-ink-500">{course.summary}</p>
+          <p className="line-clamp-2 flex-1 text-sm text-ink-500">{course.description}</p>
           <div className="flex items-center justify-between border-t border-ink-100 pt-3">
             <span className="flex items-center gap-1.5 text-sm text-ink-500">
               <Clock className="h-4 w-4" aria-hidden="true" />
-              {course.durationWeeks} weeks
+              {course.durationDays} days
             </span>
             <span className="font-semibold text-ink-900-solid">
-              {formatMoney(course.priceMinor, course.currency)}
+              {formatMoney(course.monthlyPrice, course.currency)}
             </span>
           </div>
         </CardBody>

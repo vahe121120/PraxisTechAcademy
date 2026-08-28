@@ -59,7 +59,7 @@ export function Navbar() {
           {isInitializing ? null : user ? (
             <>
               <Link href="/dashboard" className="text-sm font-medium text-ink-700 hover:text-ink-900-solid">
-                {user.fullName.split(" ")[0]}
+                {user.name.split(" ")[0]}
               </Link>
               <Button size="sm" variant="ghost" onClick={handleLogout}>
                 Log out

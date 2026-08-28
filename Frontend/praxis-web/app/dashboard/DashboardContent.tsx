@@ -29,15 +29,21 @@ export function DashboardContent() {
       const [subs, myOrders, courseList, groupList] = await Promise.all([
         callWithAuth((token) => listMySubscriptions(token)),
         callWithAuth((token) => listMyOrders(token)),
-        listCourses({ pageSize: 100 }).catch(() => ({ items: [], total: 0, page: 1, pageSize: 100 })),
-        listCourseGroups().catch(() => []),
+        listCourses({ limit: 100 }).catch(() => ({
+          data: [],
+          meta: { page: 1, limit: 100, total: 0, totalPages: 0 },
+        })),
+        listCourseGroups({ limit: 100 }).catch(() => ({
+          data: [],
+          meta: { page: 1, limit: 100, total: 0, totalPages: 0 },
+        })),
       ]);
 
       // Enrich subscriptions with course/group titles via client-side
       // lookups, per the established pattern — the subscription response
       // itself only carries ids.
-      const courseTitleById = new Map(courseList.items.map((c) => [c.id, c.title]));
-      const groupTitleById = new Map(groupList.map((g) => [g.id, g.title]));
+      const courseTitleById = new Map(courseList.data.map((c) => [c.id, c.title]));
+      const groupTitleById = new Map(groupList.data.map((g) => [g.id, g.name]));
 
       setSubscriptions(
         subs.map((s) => ({
@@ -71,7 +77,7 @@ export function DashboardContent() {
     <div className="flex flex-col gap-8">
       <div>
         <h1 className="text-2xl font-semibold text-ink-900-solid">
-          Welcome back, {user?.fullName.split(" ")[0]}
+          Welcome back, {user?.name.split(" ")[0]}
         </h1>
         <p className="text-sm text-ink-500">Your subscriptions, payments, and Telegram access.</p>
       </div>
@@ -114,7 +120,7 @@ export function DashboardContent() {
                     <tr key={order.id}>
                       <td className="px-4 py-2.5 text-ink-500">{formatDateTime(order.createdAt)}</td>
                       <td className="px-4 py-2.5 font-medium text-ink-900-solid">
-                        {formatMoney(order.amountMinor, order.currency)}
+                        {formatMoney(order.amount, order.currency)}
                       </td>
                       <td className="px-4 py-2.5">
                         <StatusBadge status={order.status} />

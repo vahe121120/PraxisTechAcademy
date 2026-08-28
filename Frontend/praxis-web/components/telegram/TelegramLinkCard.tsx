@@ -1,21 +1,41 @@
 "use client";
 
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Send, CheckCircle2 } from "lucide-react";
 import { Card, CardBody } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
+import { Spinner } from "@/components/ui/Spinner";
 import { useAuth } from "@/context/AuthContext";
-import { requestTelegramLink } from "@/lib/api/telegram";
+import { getTelegramLinkStatus, requestTelegramLink } from "@/lib/api/telegram";
 import { ApiError } from "@/lib/api/http";
 
 export function TelegramLinkCard() {
   const { user, callWithAuth } = useAuth();
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLinked, setIsLinked] = useState<boolean | null>(null);
+  const [isConnecting, setIsConnecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const loadStatus = useCallback(async () => {
+    try {
+      const { linked } = await callWithAuth((token) => getTelegramLinkStatus(token));
+      setIsLinked(linked);
+    } catch {
+      // Non-critical — the card just shows the "connect" state until this
+      // succeeds on a future render/retry.
+      setIsLinked(false);
+    }
+  }, [callWithAuth]);
+
+  useEffect(() => {
+    // Sanctioned "fetch from an external system on mount" pattern — the
+    // setState above only ever runs after the awaited call resolves.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    loadStatus();
+  }, [loadStatus]);
 
   async function handleConnect() {
     setError(null);
-    setIsLoading(true);
+    setIsConnecting(true);
     try {
       const { deepLink } = await callWithAuth((token) => requestTelegramLink(token));
       window.open(deepLink, "_blank", "noopener,noreferrer");
@@ -24,7 +44,7 @@ export function TelegramLinkCard() {
         err instanceof ApiError ? err.message : "Couldn't get a Telegram link. Try again.",
       );
     } finally {
-      setIsLoading(false);
+      setIsConnecting(false);
     }
   }
 
@@ -40,16 +60,18 @@ export function TelegramLinkCard() {
           <div>
             <p className="font-medium text-ink-900-solid">Telegram cohort access</p>
             <p className="text-sm text-ink-500">
-              {user.telegramLinked
+              {isLinked
                 ? "Your account is linked."
                 : "Connect Telegram to join your cohort's group."}
             </p>
           </div>
         </div>
-        {user.telegramLinked ? (
+        {isLinked === null ? (
+          <Spinner className="h-5 w-5 text-ink-300" />
+        ) : isLinked ? (
           <CheckCircle2 className="h-6 w-6 text-success-500" aria-hidden="true" />
         ) : (
-          <Button size="sm" onClick={handleConnect} isLoading={isLoading}>
+          <Button size="sm" onClick={handleConnect} isLoading={isConnecting}>
             Connect Telegram
           </Button>
         )}

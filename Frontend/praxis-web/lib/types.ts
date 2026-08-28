@@ -1,105 +1,178 @@
-// Mirrors praxis-api response shapes exactly. Money fields are integers in
-// minor units (e.g. AMD cents) — never floats. Divide by 100 only at the
-// display edge; never store or compare the divided value.
+// Mirrors praxis-api (Admin_Panel_Backend) response shapes exactly — see
+// the corresponding Prisma models / DTOs / response-mapper interfaces in
+// Admin_Panel_Backend/src for the source of truth each type below is
+// derived from. Money fields are integers in minor units (e.g. AMD cents)
+// — never floats. Divide by 100 only at the display edge (lib/money.ts);
+// never store or compare the divided value.
+//
+// Dates are typed as `string` (ISO 8601) throughout, matching what actually
+// arrives over JSON — the backend's `Date` fields are serialized to strings
+// by the time they reach the browser; there is no runtime `Date` here.
 
 export type Role = "STUDENT" | "TEACHER" | "ADMIN";
 
+export type UserStatus = "ACTIVE" | "SUSPENDED" | "DELETED";
+
+export type CourseTrack = "FUNDAMENTALS" | "PROFESSION" | "COMBINED" | "MINI";
+
 export type CourseStatus = "DRAFT" | "PUBLISHED" | "ARCHIVED";
 
-export type CourseGroupStatus = "SCHEDULED" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
+export type CourseGroupStatus = "UPCOMING" | "ACTIVE" | "COMPLETED" | "CANCELLED";
 
-export type OrderStatus = "PENDING" | "PAID" | "EXPIRED" | "CANCELLED" | "FAILED";
+export type OrderStatus = "PENDING" | "PAID" | "EXPIRED" | "CANCELLED";
+
+export type PaymentStatus =
+  | "INITIATED"
+  | "PENDING"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "CANCELLED"
+  | "REFUNDED";
 
 export type SubscriptionStatus = "PENDING" | "ACTIVE" | "EXPIRED" | "CANCELLED";
 
+// See Admin_Panel_Backend/src/users/interfaces/safe-user.interface.ts
+// (toSafeUser) — this is exactly what every endpoint returning a user
+// exposes, and nothing more.
 export interface SafeUser {
   id: string;
   email: string;
-  fullName: string;
+  name: string;
   phone: string | null;
+  telegramUsername: string | null;
   role: Role;
-  isSuspended: boolean;
-  telegramLinked: boolean;
+  status: UserStatus;
+  locale: string;
+  emailVerifiedAt: string | null;
   createdAt: string;
+  updatedAt: string;
 }
 
+// Raw Prisma `Course` row, as returned unmapped by CoursesController.
 export interface Course {
   id: string;
-  title: string;
   slug: string;
-  track: string;
-  summary: string;
+  title: string;
   description: string;
-  priceMinor: number;
+  track: CourseTrack;
+  monthlyPrice: number;
   currency: string;
-  durationWeeks: number;
+  durationDays: number;
   status: CourseStatus;
   createdAt: string;
   updatedAt: string;
 }
 
+// See Admin_Panel_Backend/src/course-groups/interfaces/course-group-response.interface.ts
+// (toCourseGroupResponse). Note there is no `enrolledCount` — the API does
+// not expose a live enrollment count for a course group.
 export interface CourseGroup {
   id: string;
   courseId: string;
-  title: string;
+  name: string;
   startDate: string;
-  endDate: string;
-  capacity: number;
-  enrolledCount: number;
+  endDate: string | null;
+  schedule: string;
+  teacherId: string | null;
+  capacity: number | null;
   status: CourseGroupStatus;
   telegramGroupId: string | null;
   createdAt: string;
+  updatedAt: string;
 }
 
+// Raw Prisma `Order` row, as returned unmapped by OrdersController.
 export interface Order {
   id: string;
-  studentId: string;
+  orderNumber: string;
+  userId: string;
   courseGroupId: string;
-  amountMinor: number;
+  subscriptionId: string | null;
+  amount: number;
   currency: string;
   status: OrderStatus;
-  expiresAt: string;
+  periodStart: string;
+  periodEnd: string;
+  description: string | null;
   createdAt: string;
+  expiresAt: string | null;
+  cancelledAt: string | null;
 }
 
+// Raw Prisma `Payment` row. `amount`/`currency` are NOT columns on this
+// model in the backend schema — they live on `Order` — so they're only
+// ever present here when the endpoint explicitly joins and flattens them
+// (see AdminStudentsController's payments endpoint). Treat as optional.
 export interface Payment {
   id: string;
   orderId: string;
   provider: string;
-  providerReference: string | null;
-  amountMinor: number;
-  currency: string;
-  status: "PENDING" | "SUCCEEDED" | "FAILED";
-  createdAt: string;
+  providerOrderId: string;
+  status: PaymentStatus;
+  attemptNumber: number;
+  approvalCode: string | null;
+  rrn: string | null;
+  cardMask: string | null;
+  cardBrand: string | null;
+  failureCode: string | null;
+  failureMessage: string | null;
+  initiatedAt: string;
+  completedAt: string | null;
+  /** Flattened in from the related Order — see the admin payments endpoint. */
+  amount?: number;
+  /** Flattened in from the related Order — see the admin payments endpoint. */
+  currency?: string;
 }
 
+// See Admin_Panel_Backend/src/subscriptions/interfaces/subscription-response.interface.ts
+// (toSubscriptionResponse).
 export interface Subscription {
   id: string;
   studentId: string;
-  courseId: string;
   courseGroupId: string;
+  courseId: string;
   status: SubscriptionStatus;
-  startedAt: string | null;
-  expiresAt: string | null;
+  startDate: string | null;
+  expireDate: string | null;
+  autoRenew: boolean;
+  cancelledAt: string | null;
   createdAt: string;
-  // Enriched client-side via lookups against /courses and /course-groups
+  updatedAt: string;
+  // Enriched client-side via lookups against /courses and /course-groups —
+  // the API response itself only carries ids.
   courseTitle?: string;
   courseGroupTitle?: string;
+}
+
+// See Admin_Panel_Backend/src/admin/interfaces/dashboard-stats.interface.ts.
+export interface RevenueByCurrency {
+  currency: string;
+  amount: number;
+}
+
+export interface PopularCourse {
+  courseId: string;
+  title: string;
+  enrollmentCount: number;
 }
 
 export interface DashboardStats {
   totalStudents: number;
   activeSubscriptions: number;
-  pendingOrders: number;
-  revenueMinorThisMonth: number;
-  currency: string;
+  expiredSubscriptions: number;
+  monthlyRevenue: RevenueByCurrency[];
+  popularCourses: PopularCourse[];
 }
 
+// See Admin_Panel_Backend/src/common/interfaces/paginated-result.interface.ts.
 export interface PaginatedResult<T> {
-  items: T[];
-  total: number;
-  page: number;
-  pageSize: number;
+  data: T[];
+  meta: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
 }
 
 export interface ApiErrorBody {
@@ -108,7 +181,9 @@ export interface ApiErrorBody {
   error?: string;
 }
 
+// /auth/register, /auth/login, /auth/refresh all return exactly
+// `{ user, accessToken }` — the refresh token itself is never in the JSON
+// body, only in the httpOnly cookie the backend sets alongside it.
 export interface TokenPair {
   accessToken: string;
-  expiresIn: number;
 }

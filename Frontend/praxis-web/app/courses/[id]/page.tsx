@@ -28,7 +28,7 @@ export async function generateMetadata({ params }: CourseDetailPageProps): Promi
   const { id } = await params;
   try {
     const course = await getCourse(id);
-    return { title: course.title, description: course.summary };
+    return { title: course.title, description: course.description };
   } catch {
     return { title: "Course" };
   }
@@ -37,9 +37,15 @@ export async function generateMetadata({ params }: CourseDetailPageProps): Promi
 export default async function CourseDetailPage({ params }: CourseDetailPageProps) {
   const { id } = await params;
   const course = await loadCourse(id);
-  const groups = await listCourseGroups({ courseId: course.id }).catch(() => []);
+  // GET /course-groups is paginated ({data, meta}), not a bare array.
+  const groupsResult = await listCourseGroups({ courseId: course.id }).catch(() => ({
+    data: [],
+    meta: { page: 1, limit: 20, total: 0, totalPages: 0 },
+  }));
 
-  const upcomingGroups = groups.filter((g) => g.status !== "COMPLETED" && g.status !== "CANCELLED");
+  const upcomingGroups = groupsResult.data.filter(
+    (g) => g.status !== "COMPLETED" && g.status !== "CANCELLED",
+  );
 
   return (
     <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6 lg:px-8">
@@ -47,16 +53,15 @@ export default async function CourseDetailPage({ params }: CourseDetailPageProps
       <h1 className="mt-3 text-3xl font-semibold tracking-tight text-ink-900-solid">
         {course.title}
       </h1>
-      <p className="mt-3 text-lg text-ink-500">{course.summary}</p>
 
       <div className="mt-4 flex flex-wrap items-center gap-4 text-sm text-ink-500">
         <span className="flex items-center gap-1.5">
           <Clock className="h-4 w-4" aria-hidden="true" />
-          {course.durationWeeks} weeks
+          {course.durationDays} days
         </span>
         <span className="flex items-center gap-1.5">
           <Layers className="h-4 w-4" aria-hidden="true" />
-          {formatMoney(course.priceMinor, course.currency)}
+          {formatMoney(course.monthlyPrice, course.currency)}
         </span>
       </div>
 

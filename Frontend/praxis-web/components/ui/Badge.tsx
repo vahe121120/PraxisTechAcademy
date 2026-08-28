@@ -24,14 +24,17 @@ const STATUS_TONE: Record<string, Tone> = {
   PAID: "success",
   SUCCEEDED: "success",
   PENDING: "warning",
-  IN_PROGRESS: "warning",
-  SCHEDULED: "brand",
+  INITIATED: "warning",
+  UPCOMING: "brand",
   DRAFT: "neutral",
   EXPIRED: "danger",
   FAILED: "danger",
   CANCELLED: "danger",
   ARCHIVED: "neutral",
   COMPLETED: "neutral",
+  REFUNDED: "neutral",
+  SUSPENDED: "danger",
+  DELETED: "neutral",
 };
 
 export function StatusBadge({ status }: { status: string }) {

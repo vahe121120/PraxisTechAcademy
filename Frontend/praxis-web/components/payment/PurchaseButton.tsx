@@ -30,11 +30,11 @@ export function PurchaseButton({ courseGroupId, disabled }: PurchaseButtonProps)
     setIsLoading(true);
     try {
       const order = await callWithAuth((token) => createOrder({ courseGroupId }, token));
-      const { redirectUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
+      const { paymentUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
       // The order id is carried via sessionStorage because the backend's
       // ARCA_RETURN_URL is a single fixed URL, not per-order.
       sessionStorage.setItem("praxis:pendingOrderId", order.id);
-      window.location.href = redirectUrl;
+      window.location.href = paymentUrl;
     } catch (err) {
       setError(
         err instanceof ApiError

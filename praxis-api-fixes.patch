@@ -1,0 +1,1475 @@
+diff --git a/Admin_Panel_Backend/src/admin/admin-students.controller.ts b/Admin_Panel_Backend/src/admin/admin-students.controller.ts
+index 811c22ee..d7c5ca0d 100644
+--- a/Admin_Panel_Backend/src/admin/admin-students.controller.ts
++++ b/Admin_Panel_Backend/src/admin/admin-students.controller.ts
+@@ -8,11 +8,12 @@ import {
+   Query,
+   UseGuards,
+ } from '@nestjs/common';
+-import { Payment, UserRole } from '@prisma/client';
++import { UserRole } from '@prisma/client';
+ 
+ import { Roles } from '../auth/decorators/roles.decorator';
+ import { RolesGuard } from '../auth/guards/roles.guard';
+ import { PaginatedResult } from '../common/interfaces/paginated-result.interface';
++import { PaymentResponse } from '../payments/interfaces/payment-response.interface';
+ import { PaymentsService } from '../payments/payments.service';
+ import { SubscriptionResponse } from '../subscriptions/interfaces/subscription-response.interface';
+ import { SubscriptionsService } from '../subscriptions/subscriptions.service';
+@@ -54,7 +55,7 @@ export class AdminStudentsController {
+   findPayments(
+     @Param('id', ParseUUIDPipe) id: string,
+     @Query() query: PaginationQueryDto,
+-  ): Promise<PaginatedResult<Payment>> {
++  ): Promise<PaginatedResult<PaymentResponse>> {
+     return this.paymentsService.findByUser(id, query.page, query.limit);
+   }
+ 
+diff --git a/Admin_Panel_Backend/src/orders/orders.module.ts b/Admin_Panel_Backend/src/orders/orders.module.ts
+index 05231265..d49daa65 100644
+--- a/Admin_Panel_Backend/src/orders/orders.module.ts
++++ b/Admin_Panel_Backend/src/orders/orders.module.ts
+@@ -2,10 +2,15 @@ import { Module } from '@nestjs/common';
+ 
+ import { OrdersController } from './orders.controller';
+ import { OrdersService } from './orders.service';
++import { OrderExpirationScheduler } from './scheduler/order-expiration.scheduler';
+ 
+ @Module({
+   controllers: [OrdersController],
+-  providers: [OrdersService],
++  // OrderExpirationScheduler is discovered by the app-wide
++  // `ScheduleModule.forRoot()` registered once in AppModule — see that
++  // scheduler's own doc comment for why this runs on a short interval
++  // rather than daily like SubscriptionExpirationScheduler.
++  providers: [OrdersService, OrderExpirationScheduler],
+   exports: [OrdersService],
+ })
+ export class OrdersModule {}
+diff --git a/Admin_Panel_Backend/src/orders/scheduler/order-expiration.scheduler.ts b/Admin_Panel_Backend/src/orders/scheduler/order-expiration.scheduler.ts
+new file mode 100644
+index 00000000..71bbf603
+--- /dev/null
++++ b/Admin_Panel_Backend/src/orders/scheduler/order-expiration.scheduler.ts
+@@ -0,0 +1,47 @@
++import { Injectable, Logger } from '@nestjs/common';
++import { Cron, CronExpression } from '@nestjs/schedule';
++
++import { OrdersService } from '../orders.service';
++
++/**
++ * Sweeps unpaid Orders past their `expiresAt` window and marks them
++ * EXPIRED. `OrdersService.expireStaleOrders()` already implements the rule
++ * (see its own doc comment) — this class only owns *scheduling* it, same
++ * split as `SubscriptionExpirationScheduler`/`SubscriptionsService`.
++ *
++ * Runs every 15 minutes rather than once a day: unlike subscription
++ * expiration (a slow, once-daily business event), an Order's `expiresAt`
++ * window is typically ~30 minutes (see `ORDER_EXPIRY_MINUTES`), so a
++ * once-a-day sweep would leave newly-expired orders visibly stuck in
++ * PENDING for up to 24 hours — long enough to confuse both students
++ * (checkout page shows a "pending" order they can no longer pay) and
++ * admins reviewing the orders list. A short interval keeps that window
++ * tight without needing a queue for what's a cheap, idempotent
++ * `updateMany` against an indexed column.
++ */
++@Injectable()
++export class OrderExpirationScheduler {
++  private readonly logger = new Logger(OrderExpirationScheduler.name);
++
++  constructor(private readonly ordersService: OrdersService) {}
++
++  @Cron(CronExpression.EVERY_15_MINUTES, {
++    name: 'order-expiration-check',
++    timeZone: 'Asia/Yerevan',
++  })
++  async handleExpirationSweep(): Promise<void> {
++    try {
++      const expiredCount = await this.ordersService.expireStaleOrders();
++      if (expiredCount > 0) {
++        this.logger.log(`Order expiration sweep: ${expiredCount} order(s) marked EXPIRED.`);
++      }
++    } catch (error) {
++      // A single bad sweep must never crash the scheduler process — log
++      // and let the next scheduled run pick up whatever is still overdue.
++      this.logger.error(
++        'Order expiration sweep failed',
++        error instanceof Error ? error.stack : String(error),
++      );
++    }
++  }
++}
+diff --git a/Admin_Panel_Backend/src/payments/interfaces/payment-response.interface.ts b/Admin_Panel_Backend/src/payments/interfaces/payment-response.interface.ts
+new file mode 100644
+index 00000000..3fb0d5f7
+--- /dev/null
++++ b/Admin_Panel_Backend/src/payments/interfaces/payment-response.interface.ts
+@@ -0,0 +1,57 @@
++import type { Payment } from '@prisma/client';
++
++export interface PaymentWithOrderAmount extends Payment {
++  order: {
++    amount: number;
++    currency: string;
++  };
++}
++
++/**
++ * `Payment` itself has neither an `amount` nor a `currency` column — both
++ * live on the parent `Order` (see the schema comment on Payment) — but an
++ * admin reviewing a student's payment history needs to see how much each
++ * attempt was for without a second round trip per row. This flattens those
++ * two fields in from the already-joined `order` relation, the same
++ * flattening pattern used by `toCourseGroupResponse` (telegramGroupId) and
++ * `toSubscriptionResponse` (studentId/courseId).
++ */
++export interface PaymentResponse {
++  id: string;
++  orderId: string;
++  provider: Payment['provider'];
++  providerOrderId: string;
++  status: Payment['status'];
++  attemptNumber: number;
++  approvalCode: string | null;
++  rrn: string | null;
++  cardMask: string | null;
++  cardBrand: string | null;
++  failureCode: string | null;
++  failureMessage: string | null;
++  initiatedAt: Date;
++  completedAt: Date | null;
++  amount: number;
++  currency: string;
++}
++
++export function toPaymentResponse(payment: PaymentWithOrderAmount): PaymentResponse {
++  return {
++    id: payment.id,
++    orderId: payment.orderId,
++    provider: payment.provider,
++    providerOrderId: payment.providerOrderId,
++    status: payment.status,
++    attemptNumber: payment.attemptNumber,
++    approvalCode: payment.approvalCode,
++    rrn: payment.rrn,
++    cardMask: payment.cardMask,
++    cardBrand: payment.cardBrand,
++    failureCode: payment.failureCode,
++    failureMessage: payment.failureMessage,
++    initiatedAt: payment.initiatedAt,
++    completedAt: payment.completedAt,
++    amount: payment.order.amount,
++    currency: payment.order.currency,
++  };
++}
+diff --git a/Admin_Panel_Backend/src/payments/payments.service.ts b/Admin_Panel_Backend/src/payments/payments.service.ts
+index 60b58e28..0150143b 100644
+--- a/Admin_Panel_Backend/src/payments/payments.service.ts
++++ b/Admin_Panel_Backend/src/payments/payments.service.ts
+@@ -23,6 +23,7 @@ import { OrdersService } from '../orders/orders.service';
+ import { PrismaService } from '../prisma/prisma.service';
+ import { TELEGRAM_ACCESS_PORT, TelegramAccessPort } from '../telegram/telegram-access.port';
+ import { SafeUser } from '../users/interfaces/safe-user.interface';
++import { PaymentResponse, toPaymentResponse } from './interfaces/payment-response.interface';
+ import { PaymentGatewayError } from './providers/payment-gateway.error';
+ import {
+   PaymentProvider,
+@@ -147,21 +148,33 @@ export class PaymentsService {
+    * (see the schema comment on Order for why) — it's reached via
+    * `Payment.order.userId`.
+    */
+-  async findByUser(userId: string, page = 1, limit = 20): Promise<PaginatedResult<Payment>> {
++  async findByUser(
++    userId: string,
++    page = 1,
++    limit = 20,
++  ): Promise<PaginatedResult<PaymentResponse>> {
+     const where: Prisma.PaymentWhereInput = { order: { userId } };
+     const skip = (page - 1) * limit;
+ 
+-    const [data, total] = await Promise.all([
++    const [rows, total] = await Promise.all([
+       this.prisma.payment.findMany({
+         where,
+         skip,
+         take: limit,
+         orderBy: { initiatedAt: 'desc' },
++        // Amount/currency live on Order, not Payment (see the schema
++        // comment on Payment) — joined here so an admin reviewing a
++        // student's payment history sees how much each attempt was for
++        // without an extra round trip per row.
++        include: { order: { select: { amount: true, currency: true } } },
+       }),
+       this.prisma.payment.count({ where }),
+     ]);
+ 
+-    return { data, meta: { page, limit, total, totalPages: Math.ceil(total / limit) } };
++    return {
++      data: rows.map(toPaymentResponse),
++      meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
++    };
+   }
+ 
+   // ---------------------------------------------------------------------
+diff --git a/Frontend/praxis-web/app/courses/[id]/page.tsx b/Frontend/praxis-web/app/courses/[id]/page.tsx
+index 35704174..0ac50b20 100644
+--- a/Frontend/praxis-web/app/courses/[id]/page.tsx
++++ b/Frontend/praxis-web/app/courses/[id]/page.tsx
+@@ -28,7 +28,7 @@ export async function generateMetadata({ params }: CourseDetailPageProps): Promi
+   const { id } = await params;
+   try {
+     const course = await getCourse(id);
+-    return { title: course.title, description: course.summary };
++    return { title: course.title, description: course.description };
+   } catch {
+     return { title: "Course" };
+   }
+@@ -37,9 +37,15 @@ export async function generateMetadata({ params }: CourseDetailPageProps): Promi
+ export default async function CourseDetailPage({ params }: CourseDetailPageProps) {
+   const { id } = await params;
+   const course = await loadCourse(id);
+-  const groups = await listCourseGroups({ courseId: course.id }).catch(() => []);
++  // GET /course-groups is paginated ({data, meta}), not a bare array.
++  const groupsResult = await listCourseGroups({ courseId: course.id }).catch(() => ({
++    data: [],
++    meta: { page: 1, limit: 20, total: 0, totalPages: 0 },
++  }));
+ 
+-  const upcomingGroups = groups.filter((g) => g.status !== "COMPLETED" && g.status !== "CANCELLED");
++  const upcomingGroups = groupsResult.data.filter(
++    (g) => g.status !== "COMPLETED" && g.status !== "CANCELLED",
++  );
+ 
+   return (
+     <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6 lg:px-8">
+@@ -47,16 +53,15 @@ export default async function CourseDetailPage({ params }: CourseDetailPageProps
+       <h1 className="mt-3 text-3xl font-semibold tracking-tight text-ink-900-solid">
+         {course.title}
+       </h1>
+-      <p className="mt-3 text-lg text-ink-500">{course.summary}</p>
+ 
+       <div className="mt-4 flex flex-wrap items-center gap-4 text-sm text-ink-500">
+         <span className="flex items-center gap-1.5">
+           <Clock className="h-4 w-4" aria-hidden="true" />
+-          {course.durationWeeks} weeks
++          {course.durationDays} days
+         </span>
+         <span className="flex items-center gap-1.5">
+           <Layers className="h-4 w-4" aria-hidden="true" />
+-          {formatMoney(course.priceMinor, course.currency)}
++          {formatMoney(course.monthlyPrice, course.currency)}
+         </span>
+       </div>
+ 
+diff --git a/Frontend/praxis-web/app/courses/page.tsx b/Frontend/praxis-web/app/courses/page.tsx
+index ad990a55..a3ea154d 100644
+--- a/Frontend/praxis-web/app/courses/page.tsx
++++ b/Frontend/praxis-web/app/courses/page.tsx
+@@ -1,6 +1,7 @@
+ import type { Metadata } from "next";
+ import { BookX } from "lucide-react";
+ import { listCourses } from "@/lib/api/courses";
++import type { Course, CourseTrack } from "@/lib/types";
+ import { CourseCard } from "@/components/course/CourseCard";
+ import { TrackFilter } from "@/components/course/TrackFilter";
+ import { EmptyState } from "@/components/ui/EmptyState";
+@@ -14,11 +15,14 @@ interface CoursesPageProps {
+ export default async function CoursesPage({ searchParams }: CoursesPageProps) {
+   const { track } = await searchParams;
+ 
+-  let courses: Awaited<ReturnType<typeof listCourses>>["items"] = [];
++  let courses: Course[] = [];
+   let loadError = false;
+   try {
+-    const result = await listCourses({ track, pageSize: 50 });
+-    courses = result.items;
++    // `track` comes straight off the URL and is whatever the visitor typed
++    // — the backend validates it against the real CourseTrack enum and
++    // 400s on anything else, which the catch below turns into loadError.
++    const result = await listCourses({ track: track as CourseTrack | undefined, limit: 50 });
++    courses = result.data;
+   } catch {
+     loadError = true;
+   }
+diff --git a/Frontend/praxis-web/app/dashboard/DashboardContent.tsx b/Frontend/praxis-web/app/dashboard/DashboardContent.tsx
+index df3cd324..c50486ea 100644
+--- a/Frontend/praxis-web/app/dashboard/DashboardContent.tsx
++++ b/Frontend/praxis-web/app/dashboard/DashboardContent.tsx
+@@ -29,15 +29,21 @@ export function DashboardContent() {
+       const [subs, myOrders, courseList, groupList] = await Promise.all([
+         callWithAuth((token) => listMySubscriptions(token)),
+         callWithAuth((token) => listMyOrders(token)),
+-        listCourses({ pageSize: 100 }).catch(() => ({ items: [], total: 0, page: 1, pageSize: 100 })),
+-        listCourseGroups().catch(() => []),
++        listCourses({ limit: 100 }).catch(() => ({
++          data: [],
++          meta: { page: 1, limit: 100, total: 0, totalPages: 0 },
++        })),
++        listCourseGroups({ limit: 100 }).catch(() => ({
++          data: [],
++          meta: { page: 1, limit: 100, total: 0, totalPages: 0 },
++        })),
+       ]);
+ 
+       // Enrich subscriptions with course/group titles via client-side
+       // lookups, per the established pattern — the subscription response
+       // itself only carries ids.
+-      const courseTitleById = new Map(courseList.items.map((c) => [c.id, c.title]));
+-      const groupTitleById = new Map(groupList.map((g) => [g.id, g.title]));
++      const courseTitleById = new Map(courseList.data.map((c) => [c.id, c.title]));
++      const groupTitleById = new Map(groupList.data.map((g) => [g.id, g.name]));
+ 
+       setSubscriptions(
+         subs.map((s) => ({
+@@ -71,7 +77,7 @@ export function DashboardContent() {
+     <div className="flex flex-col gap-8">
+       <div>
+         <h1 className="text-2xl font-semibold text-ink-900-solid">
+-          Welcome back, {user?.fullName.split(" ")[0]}
++          Welcome back, {user?.name.split(" ")[0]}
+         </h1>
+         <p className="text-sm text-ink-500">Your subscriptions, payments, and Telegram access.</p>
+       </div>
+@@ -114,7 +120,7 @@ export function DashboardContent() {
+                     <tr key={order.id}>
+                       <td className="px-4 py-2.5 text-ink-500">{formatDateTime(order.createdAt)}</td>
+                       <td className="px-4 py-2.5 font-medium text-ink-900-solid">
+-                        {formatMoney(order.amountMinor, order.currency)}
++                        {formatMoney(order.amount, order.currency)}
+                       </td>
+                       <td className="px-4 py-2.5">
+                         <StatusBadge status={order.status} />
+diff --git a/Frontend/praxis-web/app/payment/return/PaymentReturnContent.tsx b/Frontend/praxis-web/app/payment/return/PaymentReturnContent.tsx
+index 3e3ddcc0..9d93a528 100644
+--- a/Frontend/praxis-web/app/payment/return/PaymentReturnContent.tsx
++++ b/Frontend/praxis-web/app/payment/return/PaymentReturnContent.tsx
+@@ -42,12 +42,20 @@ export function PaymentReturnContent() {
+         const result = await callWithAuth((token) => getPaymentStatus(orderId!, token));
+         if (cancelled) return;
+ 
+-        if (result.orderStatus === "PAID") {
++        if (result.order.status === "PAID") {
+           sessionStorage.removeItem("praxis:pendingOrderId");
+           setState("paid");
+           return;
+         }
+-        if (result.orderStatus === "FAILED" || result.orderStatus === "CANCELLED") {
++        // OrderStatus itself has no FAILED value — a failed attempt leaves
++        // the Order PENDING (still retryable) unless it also expired or was
++        // cancelled outright. A FAILED latest payment on a still-PENDING
++        // order means this specific attempt didn't go through.
++        if (
++          result.order.status === "EXPIRED" ||
++          result.order.status === "CANCELLED" ||
++          result.latestPayment?.status === "FAILED"
++        ) {
+           setState("failed");
+           return;
+         }
+diff --git a/Frontend/praxis-web/components/admin/AdminContent.tsx b/Frontend/praxis-web/components/admin/AdminContent.tsx
+index 470b729b..72f22eaf 100644
+--- a/Frontend/praxis-web/components/admin/AdminContent.tsx
++++ b/Frontend/praxis-web/components/admin/AdminContent.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import { useCallback, useEffect, useState } from "react";
+-import { Users, CreditCard, TrendingUp, Clock } from "lucide-react";
++import { Users, CreditCard, TrendingUp, ShieldOff } from "lucide-react";
+ import { useAuth } from "@/context/AuthContext";
+ import { getDashboardStats } from "@/lib/api/admin";
+ import { ApiError } from "@/lib/api/http";
+@@ -23,16 +23,33 @@ export function AdminContent() {
+   // shows a "Suspended" badge) reflects the change without a full remount.
+   const [listRefreshKey, setListRefreshKey] = useState(0);
+ 
+-  useEffect(() => {
++  const loadStats = useCallback(() => {
++    setStatsError(null);
+     callWithAuth((token) => getDashboardStats(token))
+       .then(setStats)
+       .catch((err) => setStatsError(err instanceof ApiError ? err.message : "Couldn't load stats."));
+   }, [callWithAuth]);
+ 
++  useEffect(() => {
++    // Sanctioned "fetch from an external system on mount" pattern.
++    // eslint-disable-next-line react-hooks/set-state-in-effect
++    loadStats();
++  }, [loadStats]);
++
+   const handleStudentChanged = useCallback(() => {
+     setListRefreshKey((k) => k + 1);
+   }, []);
+ 
++  // Revenue is reported per-currency (see DashboardStats.monthlyRevenue) —
++  // the business operates in a single currency in practice, but the stat
++  // card renders whatever the API actually returns rather than assuming a
++  // single number/currency pair.
++  const revenueLabel = stats
++    ? stats.monthlyRevenue.length === 0
++      ? formatMoney(0, "AMD")
++      : stats.monthlyRevenue.map((r) => formatMoney(r.amount, r.currency)).join(" / ")
++    : "";
++
+   return (
+     <div className="flex flex-col gap-8">
+       <div>
+@@ -41,7 +58,7 @@ export function AdminContent() {
+       </div>
+ 
+       {statsError ? (
+-        <ErrorState message={statsError} />
++        <ErrorState message={statsError} onRetry={loadStats} />
+       ) : !stats ? (
+         <div className="flex justify-center py-6">
+           <Spinner className="h-5 w-5 text-brand-500" />
+@@ -54,12 +71,12 @@ export function AdminContent() {
+             value={stats.activeSubscriptions.toLocaleString()}
+             icon={TrendingUp}
+           />
+-          <StatCard label="Pending orders" value={stats.pendingOrders.toLocaleString()} icon={Clock} />
+           <StatCard
+-            label="Revenue this month"
+-            value={formatMoney(stats.revenueMinorThisMonth, stats.currency)}
+-            icon={CreditCard}
++            label="Expired subscriptions"
++            value={stats.expiredSubscriptions.toLocaleString()}
++            icon={ShieldOff}
+           />
++          <StatCard label="Revenue this month" value={revenueLabel} icon={CreditCard} />
+         </div>
+       )}
+ 
+diff --git a/Frontend/praxis-web/components/admin/StudentDetail.tsx b/Frontend/praxis-web/components/admin/StudentDetail.tsx
+index c0ec13dd..4a7ab550 100644
+--- a/Frontend/praxis-web/components/admin/StudentDetail.tsx
++++ b/Frontend/praxis-web/components/admin/StudentDetail.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import { useCallback, useEffect, useState } from "react";
+-import { ShieldOff, ShieldCheck, Mail, Phone, Send } from "lucide-react";
++import { ShieldOff, ShieldCheck, Mail, Phone } from "lucide-react";
+ import { useAuth } from "@/context/AuthContext";
+ import {
+   getStudent,
+@@ -48,12 +48,15 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+     try {
+       const [studentResult, paymentsResult, subscriptionsResult] = await Promise.all([
+         callWithAuth((token) => getStudent(studentId, token)),
+-        callWithAuth((token) => getStudentPayments(studentId, token)),
+-        callWithAuth((token) => getStudentSubscriptions(studentId, token)),
++        // Both admin sub-resources are paginated — take the first page at a
++        // generous limit rather than the default 20, since this panel has
++        // no pagination controls of its own yet.
++        callWithAuth((token) => getStudentPayments(studentId, token, { limit: 100 })),
++        callWithAuth((token) => getStudentSubscriptions(studentId, token, { limit: 100 })),
+       ]);
+       setStudent(studentResult);
+-      setPayments(paymentsResult);
+-      setSubscriptions(subscriptionsResult);
++      setPayments(paymentsResult.data);
++      setSubscriptions(subscriptionsResult.data);
+     } catch (err) {
+       setError(err instanceof ApiError ? err.message : "Couldn't load this student.");
+     } finally {
+@@ -76,7 +79,8 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+     setMutationError(null);
+     setIsMutating(true);
+     try {
+-      const updated = student.isSuspended
++      const isSuspended = student.status === "SUSPENDED";
++      const updated = isSuspended
+         ? await callWithAuth((token) => reactivateStudent(student.id, token))
+         : await callWithAuth((token) => suspendStudent(student.id, token));
+       setStudent(updated);
+@@ -109,19 +113,16 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+   if (error) return <ErrorState message={error} onRetry={load} />;
+   if (!student) return null;
+ 
++  const isSuspended = student.status === "SUSPENDED";
++
+   return (
+     <div className="flex flex-col gap-4">
+       <Card>
+         <CardHeader className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+           <div>
+             <div className="flex items-center gap-2">
+-              <h2 className="text-lg font-semibold text-ink-900-solid">{student.fullName}</h2>
+-              {student.isSuspended && <Badge tone="danger">Suspended</Badge>}
+-              {student.telegramLinked && (
+-                <span title="Telegram linked">
+-                  <Send className="h-4 w-4 text-signal-500" aria-hidden="true" />
+-                </span>
+-              )}
++              <h2 className="text-lg font-semibold text-ink-900-solid">{student.name}</h2>
++              {isSuspended && <Badge tone="danger">Suspended</Badge>}
+             </div>
+             <div className="mt-1 flex flex-col gap-1 text-sm text-ink-500 sm:flex-row sm:gap-4">
+               <span className="flex items-center gap-1.5">
+@@ -140,12 +141,12 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+ 
+           {!confirmingSuspend ? (
+             <Button
+-              variant={student.isSuspended ? "secondary" : "danger"}
++              variant={isSuspended ? "secondary" : "danger"}
+               size="sm"
+-              onClick={() => (student.isSuspended ? handleSuspendToggle() : setConfirmingSuspend(true))}
++              onClick={() => (isSuspended ? handleSuspendToggle() : setConfirmingSuspend(true))}
+               isLoading={isMutating && !confirmingSuspend}
+             >
+-              {student.isSuspended ? (
++              {isSuspended ? (
+                 <>
+                   <ShieldCheck className="h-4 w-4" aria-hidden="true" />
+                   Reactivate
+@@ -199,7 +200,7 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+                       {sub.courseTitle ?? sub.courseId} — {sub.courseGroupTitle ?? sub.courseGroupId}
+                     </p>
+                     <p className="text-sm text-ink-500">
+-                      {sub.expiresAt ? `Expires ${formatDate(sub.expiresAt)}` : "No expiry set"}
++                      {sub.expireDate ? `Expires ${formatDate(sub.expireDate)}` : "No expiry set"}
+                     </p>
+                   </div>
+                   <div className="flex items-center gap-3">
+@@ -236,9 +237,11 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+             <tbody className="divide-y divide-ink-100">
+               {payments.map((payment) => (
+                 <tr key={payment.id}>
+-                  <td className="px-4 py-2.5 text-ink-500">{formatDateTime(payment.createdAt)}</td>
++                  <td className="px-4 py-2.5 text-ink-500">{formatDateTime(payment.initiatedAt)}</td>
+                   <td className="px-4 py-2.5 font-medium text-ink-900-solid">
+-                    {formatMoney(payment.amountMinor, payment.currency)}
++                    {payment.amount !== undefined && payment.currency
++                      ? formatMoney(payment.amount, payment.currency)
++                      : "—"}
+                   </td>
+                   <td className="px-4 py-2.5 text-ink-500">{payment.provider}</td>
+                   <td className="px-4 py-2.5">
+diff --git a/Frontend/praxis-web/components/admin/StudentSearch.tsx b/Frontend/praxis-web/components/admin/StudentSearch.tsx
+index 3615fc9d..5474c89a 100644
+--- a/Frontend/praxis-web/components/admin/StudentSearch.tsx
++++ b/Frontend/praxis-web/components/admin/StudentSearch.tsx
+@@ -52,11 +52,11 @@ export function StudentSearch({ selectedId, onSelect, refreshKey }: StudentSearc
+     setIsLoading(true);
+     setError(null);
+ 
+-    callWithAuth((token) => searchStudents({ query: query || undefined, page, pageSize: PAGE_SIZE }, token))
++    callWithAuth((token) => searchStudents({ search: query || undefined, page, limit: PAGE_SIZE }, token))
+       .then((result) => {
+         if (cancelled) return;
+-        setResults(result.items);
+-        setTotal(result.total);
++        setResults(result.data);
++        setTotal(result.meta.total);
+       })
+       .catch((err) => {
+         if (cancelled) return;
+@@ -116,10 +116,10 @@ export function StudentSearch({ selectedId, onSelect, refreshKey }: StudentSearc
+                   }`}
+                 >
+                   <div className="min-w-0">
+-                    <p className="truncate font-medium text-ink-900-solid">{student.fullName}</p>
++                    <p className="truncate font-medium text-ink-900-solid">{student.name}</p>
+                     <p className="truncate text-sm text-ink-500">{student.email}</p>
+                   </div>
+-                  {student.isSuspended && <Badge tone="danger">Suspended</Badge>}
++                  {student.status === "SUSPENDED" && <Badge tone="danger">Suspended</Badge>}
+                 </button>
+               </li>
+             ))}
+diff --git a/Frontend/praxis-web/components/course/CourseCard.tsx b/Frontend/praxis-web/components/course/CourseCard.tsx
+index 75e3529b..fc01b7b8 100644
+--- a/Frontend/praxis-web/components/course/CourseCard.tsx
++++ b/Frontend/praxis-web/components/course/CourseCard.tsx
+@@ -18,14 +18,14 @@ export function CourseCard({ course }: { course: Course }) {
+             />
+           </div>
+           <h3 className="text-lg font-semibold text-ink-900-solid">{course.title}</h3>
+-          <p className="line-clamp-2 flex-1 text-sm text-ink-500">{course.summary}</p>
++          <p className="line-clamp-2 flex-1 text-sm text-ink-500">{course.description}</p>
+           <div className="flex items-center justify-between border-t border-ink-100 pt-3">
+             <span className="flex items-center gap-1.5 text-sm text-ink-500">
+               <Clock className="h-4 w-4" aria-hidden="true" />
+-              {course.durationWeeks} weeks
++              {course.durationDays} days
+             </span>
+             <span className="font-semibold text-ink-900-solid">
+-              {formatMoney(course.priceMinor, course.currency)}
++              {formatMoney(course.monthlyPrice, course.currency)}
+             </span>
+           </div>
+         </CardBody>
+diff --git a/Frontend/praxis-web/components/course/CourseGroupRow.tsx b/Frontend/praxis-web/components/course/CourseGroupRow.tsx
+index 691a33fc..0f768451 100644
+--- a/Frontend/praxis-web/components/course/CourseGroupRow.tsx
++++ b/Frontend/praxis-web/components/course/CourseGroupRow.tsx
+@@ -5,26 +5,32 @@ import { formatDate } from "@/lib/money";
+ import type { CourseGroup } from "@/lib/types";
+ 
+ export function CourseGroupRow({ group }: { group: CourseGroup }) {
+-  const seatsLeft = group.capacity - group.enrolledCount;
+-  const isFull = seatsLeft <= 0;
+-  const isPurchasable = group.status === "SCHEDULED" && !isFull;
++  // The API does not expose a live enrollment count for a course group, so
++  // "seats left" can't be computed client-side — only capacity itself is
++  // known. Purchasability is based on status alone: a group still in
++  // UPCOMING is open for enrollment; once it's ACTIVE, COMPLETED, or
++  // CANCELLED it's no longer something a new student can buy into here.
++  const isPurchasable = group.status === "UPCOMING";
+ 
+   return (
+     <div className="flex flex-col gap-3 rounded-[--radius-card] border border-ink-100 bg-white p-4 sm:flex-row sm:items-center sm:justify-between">
+       <div className="flex flex-col gap-1.5">
+         <div className="flex items-center gap-2">
+-          <span className="font-medium text-ink-900-solid">{group.title}</span>
++          <span className="font-medium text-ink-900-solid">{group.name}</span>
+           <StatusBadge status={group.status} />
+         </div>
+         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-ink-500">
+           <span className="flex items-center gap-1.5">
+             <Calendar className="h-4 w-4" aria-hidden="true" />
+-            {formatDate(group.startDate)} – {formatDate(group.endDate)}
+-          </span>
+-          <span className="flex items-center gap-1.5">
+-            <Users className="h-4 w-4" aria-hidden="true" />
+-            {isFull ? "Full" : `${seatsLeft} of ${group.capacity} seats left`}
++            {formatDate(group.startDate)}
++            {group.endDate ? ` – ${formatDate(group.endDate)}` : ""}
+           </span>
++          {group.capacity !== null && (
++            <span className="flex items-center gap-1.5">
++              <Users className="h-4 w-4" aria-hidden="true" />
++              {group.capacity} seats
++            </span>
++          )}
+         </div>
+       </div>
+       <PurchaseButton courseGroupId={group.id} disabled={!isPurchasable} />
+diff --git a/Frontend/praxis-web/components/course/TrackFilter.tsx b/Frontend/praxis-web/components/course/TrackFilter.tsx
+index c2322058..ed4d1163 100644
+--- a/Frontend/praxis-web/components/course/TrackFilter.tsx
++++ b/Frontend/praxis-web/components/course/TrackFilter.tsx
+@@ -1,16 +1,27 @@
+ "use client";
+ 
+ import { useRouter, useSearchParams } from "next/navigation";
++import type { CourseTrack } from "@/lib/types";
+ 
+-const TRACKS = ["All", "QA Automation", "Backend", "Frontend", "DevOps"];
++// Values must be exactly the backend's CourseTrack enum — QueryCoursesDto
++// validates `track` with `forbidNonWhitelisted: true`, so anything else
++// (e.g. a human label like "QA Automation") gets the whole request
++// rejected with a 400. Labels are the display text; values are what's sent.
++const TRACKS: { value: CourseTrack | "ALL"; label: string }[] = [
++  { value: "ALL", label: "All" },
++  { value: "FUNDAMENTALS", label: "Fundamentals" },
++  { value: "PROFESSION", label: "Profession" },
++  { value: "COMBINED", label: "Combined" },
++  { value: "MINI", label: "Mini course" },
++];
+ 
+ export function TrackFilter({ current }: { current?: string }) {
+   const router = useRouter();
+   const searchParams = useSearchParams();
+ 
+-  function selectTrack(track: string) {
++  function selectTrack(track: CourseTrack | "ALL") {
+     const params = new URLSearchParams(searchParams.toString());
+-    if (track === "All") {
++    if (track === "ALL") {
+       params.delete("track");
+     } else {
+       params.set("track", track);
+@@ -20,13 +31,13 @@ export function TrackFilter({ current }: { current?: string }) {
+ 
+   return (
+     <div className="flex flex-wrap gap-2" role="group" aria-label="Filter courses by track">
+-      {TRACKS.map((track) => {
+-        const isActive = track === "All" ? !current : current === track;
++      {TRACKS.map(({ value, label }) => {
++        const isActive = value === "ALL" ? !current : current === value;
+         return (
+           <button
+-            key={track}
++            key={value}
+             type="button"
+-            onClick={() => selectTrack(track)}
++            onClick={() => selectTrack(value)}
+             aria-pressed={isActive}
+             className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+               isActive
+@@ -34,7 +45,7 @@ export function TrackFilter({ current }: { current?: string }) {
+                 : "bg-white text-ink-700 border border-ink-100 hover:bg-ink-50"
+             }`}
+           >
+-            {track}
++            {label}
+           </button>
+         );
+       })}
+diff --git a/Frontend/praxis-web/components/layout/Navbar.tsx b/Frontend/praxis-web/components/layout/Navbar.tsx
+index d1864bf5..3082ca35 100644
+--- a/Frontend/praxis-web/components/layout/Navbar.tsx
++++ b/Frontend/praxis-web/components/layout/Navbar.tsx
+@@ -59,7 +59,7 @@ export function Navbar() {
+           {isInitializing ? null : user ? (
+             <>
+               <Link href="/dashboard" className="text-sm font-medium text-ink-700 hover:text-ink-900-solid">
+-                {user.fullName.split(" ")[0]}
++                {user.name.split(" ")[0]}
+               </Link>
+               <Button size="sm" variant="ghost" onClick={handleLogout}>
+                 Log out
+diff --git a/Frontend/praxis-web/components/payment/PurchaseButton.tsx b/Frontend/praxis-web/components/payment/PurchaseButton.tsx
+index 354e11de..bf3cbe7d 100644
+--- a/Frontend/praxis-web/components/payment/PurchaseButton.tsx
++++ b/Frontend/praxis-web/components/payment/PurchaseButton.tsx
+@@ -30,11 +30,11 @@ export function PurchaseButton({ courseGroupId, disabled }: PurchaseButtonProps)
+     setIsLoading(true);
+     try {
+       const order = await callWithAuth((token) => createOrder({ courseGroupId }, token));
+-      const { redirectUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
++      const { paymentUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
+       // The order id is carried via sessionStorage because the backend's
+       // ARCA_RETURN_URL is a single fixed URL, not per-order.
+       sessionStorage.setItem("praxis:pendingOrderId", order.id);
+-      window.location.href = redirectUrl;
++      window.location.href = paymentUrl;
+     } catch (err) {
+       setError(
+         err instanceof ApiError
+diff --git a/Frontend/praxis-web/components/subscription/SubscriptionCard.tsx b/Frontend/praxis-web/components/subscription/SubscriptionCard.tsx
+index fbe59582..aa4041c1 100644
+--- a/Frontend/praxis-web/components/subscription/SubscriptionCard.tsx
++++ b/Frontend/praxis-web/components/subscription/SubscriptionCard.tsx
+@@ -6,6 +6,7 @@ import { StatusBadge } from "@/components/ui/Badge";
+ import { Button } from "@/components/ui/Button";
+ import { useAuth } from "@/context/AuthContext";
+ import { renewSubscription, cancelSubscription } from "@/lib/api/subscriptions";
++import { initiatePayment } from "@/lib/api/payments";
+ import { ApiError } from "@/lib/api/http";
+ import { formatDate } from "@/lib/money";
+ import type { Subscription } from "@/lib/types";
+@@ -20,15 +21,11 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+   const [pendingAction, setPendingAction] = useState<"renew" | "cancel" | null>(null);
+   const [error, setError] = useState<string | null>(null);
+ 
+-  async function handleAction(action: "renew" | "cancel") {
++  async function handleCancel() {
+     setError(null);
+-    setPendingAction(action);
++    setPendingAction("cancel");
+     try {
+-      const updated = await callWithAuth((token) =>
+-        action === "renew"
+-          ? renewSubscription(subscription.id, token)
+-          : cancelSubscription(subscription.id, token),
+-      );
++      const updated = await callWithAuth((token) => cancelSubscription(subscription.id, token));
+       onChange(updated);
+     } catch (err) {
+       setError(err instanceof ApiError ? err.message : "That didn't go through. Try again.");
+@@ -37,6 +34,26 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+     }
+   }
+ 
++  async function handleRenew() {
++    setError(null);
++    setPendingAction("renew");
++    try {
++      // Renewing creates a new payable Order, exactly like a fresh
++      // enrollment — it does not instantly flip the subscription back to
++      // ACTIVE. The student has to complete payment first, same as
++      // PurchaseButton's flow.
++      const order = await callWithAuth((token) => renewSubscription(subscription.id, token));
++      const { paymentUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
++      sessionStorage.setItem("praxis:pendingOrderId", order.id);
++      window.location.href = paymentUrl;
++    } catch (err) {
++      setError(
++        err instanceof ApiError ? err.message : "Couldn't start renewal. Please try again.",
++      );
++      setPendingAction(null);
++    }
++  }
++
+   const canRenew = subscription.status === "EXPIRED" || subscription.status === "CANCELLED";
+   const canCancel = subscription.status === "ACTIVE" || subscription.status === "PENDING";
+ 
+@@ -52,10 +69,10 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+           </div>
+           <StatusBadge status={subscription.status} />
+         </div>
+-        {subscription.expiresAt && (
++        {subscription.expireDate && (
+           <p className="text-sm text-ink-500">
+             {subscription.status === "ACTIVE" ? "Renews" : "Expired"} on{" "}
+-            {formatDate(subscription.expiresAt)}
++            {formatDate(subscription.expireDate)}
+           </p>
+         )}
+         {error && (
+@@ -71,7 +88,7 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+                 variant="secondary"
+                 isLoading={pendingAction === "renew"}
+                 disabled={pendingAction !== null}
+-                onClick={() => handleAction("renew")}
++                onClick={handleRenew}
+               >
+                 Renew
+               </Button>
+@@ -82,7 +99,7 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+                 variant="ghost"
+                 isLoading={pendingAction === "cancel"}
+                 disabled={pendingAction !== null}
+-                onClick={() => handleAction("cancel")}
++                onClick={handleCancel}
+               >
+                 Cancel
+               </Button>
+diff --git a/Frontend/praxis-web/components/telegram/TelegramLinkCard.tsx b/Frontend/praxis-web/components/telegram/TelegramLinkCard.tsx
+index f81538f5..9ada32b6 100644
+--- a/Frontend/praxis-web/components/telegram/TelegramLinkCard.tsx
++++ b/Frontend/praxis-web/components/telegram/TelegramLinkCard.tsx
+@@ -1,21 +1,41 @@
+ "use client";
+ 
+-import { useState } from "react";
++import { useCallback, useEffect, useState } from "react";
+ import { Send, CheckCircle2 } from "lucide-react";
+ import { Card, CardBody } from "@/components/ui/Card";
+ import { Button } from "@/components/ui/Button";
++import { Spinner } from "@/components/ui/Spinner";
+ import { useAuth } from "@/context/AuthContext";
+-import { requestTelegramLink } from "@/lib/api/telegram";
++import { getTelegramLinkStatus, requestTelegramLink } from "@/lib/api/telegram";
+ import { ApiError } from "@/lib/api/http";
+ 
+ export function TelegramLinkCard() {
+   const { user, callWithAuth } = useAuth();
+-  const [isLoading, setIsLoading] = useState(false);
++  const [isLinked, setIsLinked] = useState<boolean | null>(null);
++  const [isConnecting, setIsConnecting] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+ 
++  const loadStatus = useCallback(async () => {
++    try {
++      const { linked } = await callWithAuth((token) => getTelegramLinkStatus(token));
++      setIsLinked(linked);
++    } catch {
++      // Non-critical — the card just shows the "connect" state until this
++      // succeeds on a future render/retry.
++      setIsLinked(false);
++    }
++  }, [callWithAuth]);
++
++  useEffect(() => {
++    // Sanctioned "fetch from an external system on mount" pattern — the
++    // setState above only ever runs after the awaited call resolves.
++    // eslint-disable-next-line react-hooks/set-state-in-effect
++    loadStatus();
++  }, [loadStatus]);
++
+   async function handleConnect() {
+     setError(null);
+-    setIsLoading(true);
++    setIsConnecting(true);
+     try {
+       const { deepLink } = await callWithAuth((token) => requestTelegramLink(token));
+       window.open(deepLink, "_blank", "noopener,noreferrer");
+@@ -24,7 +44,7 @@ export function TelegramLinkCard() {
+         err instanceof ApiError ? err.message : "Couldn't get a Telegram link. Try again.",
+       );
+     } finally {
+-      setIsLoading(false);
++      setIsConnecting(false);
+     }
+   }
+ 
+@@ -40,16 +60,18 @@ export function TelegramLinkCard() {
+           <div>
+             <p className="font-medium text-ink-900-solid">Telegram cohort access</p>
+             <p className="text-sm text-ink-500">
+-              {user.telegramLinked
++              {isLinked
+                 ? "Your account is linked."
+                 : "Connect Telegram to join your cohort's group."}
+             </p>
+           </div>
+         </div>
+-        {user.telegramLinked ? (
++        {isLinked === null ? (
++          <Spinner className="h-5 w-5 text-ink-300" />
++        ) : isLinked ? (
+           <CheckCircle2 className="h-6 w-6 text-success-500" aria-hidden="true" />
+         ) : (
+-          <Button size="sm" onClick={handleConnect} isLoading={isLoading}>
++          <Button size="sm" onClick={handleConnect} isLoading={isConnecting}>
+             Connect Telegram
+           </Button>
+         )}
+diff --git a/Frontend/praxis-web/components/ui/Badge.tsx b/Frontend/praxis-web/components/ui/Badge.tsx
+index d3714b98..d3d6233b 100644
+--- a/Frontend/praxis-web/components/ui/Badge.tsx
++++ b/Frontend/praxis-web/components/ui/Badge.tsx
+@@ -24,14 +24,17 @@ const STATUS_TONE: Record<string, Tone> = {
+   PAID: "success",
+   SUCCEEDED: "success",
+   PENDING: "warning",
+-  IN_PROGRESS: "warning",
+-  SCHEDULED: "brand",
++  INITIATED: "warning",
++  UPCOMING: "brand",
+   DRAFT: "neutral",
+   EXPIRED: "danger",
+   FAILED: "danger",
+   CANCELLED: "danger",
+   ARCHIVED: "neutral",
+   COMPLETED: "neutral",
++  REFUNDED: "neutral",
++  SUSPENDED: "danger",
++  DELETED: "neutral",
+ };
+ 
+ export function StatusBadge({ status }: { status: string }) {
+diff --git a/Frontend/praxis-web/lib/api/admin.ts b/Frontend/praxis-web/lib/api/admin.ts
+index d620a614..fb131bda 100644
+--- a/Frontend/praxis-web/lib/api/admin.ts
++++ b/Frontend/praxis-web/lib/api/admin.ts
+@@ -1,14 +1,22 @@
+ import { request, toQueryString } from "@/lib/api/http";
+-import type { DashboardStats, Payment, SafeUser, Subscription, PaginatedResult } from "@/lib/types";
++import type {
++  DashboardStats,
++  PaginatedResult,
++  Payment,
++  SafeUser,
++  Subscription,
++} from "@/lib/types";
+ 
++// AdminDashboardController is mounted at 'admin/dashboard', not 'admin/stats'.
+ export function getDashboardStats(accessToken: string) {
+-  return request<DashboardStats>("/admin/stats", { accessToken });
++  return request<DashboardStats>("/admin/dashboard", { accessToken });
+ }
+ 
++// Field names mirror SearchStudentsDto exactly (`search`, not `query`).
+ export interface SearchStudentsParams {
+-  query?: string;
++  search?: string;
+   page?: number;
+-  pageSize?: number;
++  limit?: number;
+ }
+ 
+ export function searchStudents(params: SearchStudentsParams, accessToken: string) {
+@@ -21,26 +29,44 @@ export function getStudent(id: string, accessToken: string) {
+   return request<SafeUser>(`/admin/students/${id}`, { accessToken });
+ }
+ 
+-export function getStudentPayments(id: string, accessToken: string) {
+-  return request<Payment[]>(`/admin/students/${id}/payments`, { accessToken });
++export interface PaginationParams {
++  page?: number;
++  limit?: number;
+ }
+ 
+-export function getStudentSubscriptions(id: string, accessToken: string) {
+-  return request<Subscription[]>(`/admin/students/${id}/subscriptions`, { accessToken });
++export function getStudentPayments(id: string, accessToken: string, params?: PaginationParams) {
++  return request<PaginatedResult<Payment>>(
++    `/admin/students/${id}/payments${toQueryString(params)}`,
++    { accessToken },
++  );
+ }
+ 
+-export function suspendStudent(id: string, accessToken: string, reason?: string) {
+-  return request<SafeUser>(`/admin/students/${id}/suspend`, {
+-    method: "POST",
+-    body: reason ? { reason } : undefined,
+-    accessToken,
+-  });
++export function getStudentSubscriptions(
++  id: string,
++  accessToken: string,
++  params?: PaginationParams,
++) {
++  return request<PaginatedResult<Subscription>>(
++    `/admin/students/${id}/subscriptions${toQueryString(params)}`,
++    { accessToken },
++  );
++}
++
++// AdminStudentsController.suspend takes no request body at all — there is
++// no "reason" field anywhere in the schema for it, so nothing is sent here.
++// (A previous version of this client silently dropped a `reason` argument
++// on the floor; removed rather than kept as dead, misleading UI.)
++export function suspendStudent(id: string, accessToken: string) {
++  return request<SafeUser>(`/admin/students/${id}/suspend`, { method: "POST", accessToken });
+ }
+ 
+ export function reactivateStudent(id: string, accessToken: string) {
+   return request<SafeUser>(`/admin/students/${id}/reactivate`, { method: "POST", accessToken });
+ }
+ 
++// ActivateSubscriptionDto accepts an optional expireDate override; omitted
++// here since no admin UI currently exposes picking one (defaults to +1
++// month server-side).
+ export function activateSubscription(id: string, accessToken: string) {
+   return request<Subscription>(`/admin/subscriptions/${id}/activate`, {
+     method: "POST",
+diff --git a/Frontend/praxis-web/lib/api/course-groups.ts b/Frontend/praxis-web/lib/api/course-groups.ts
+index 3e33797c..59600e8b 100644
+--- a/Frontend/praxis-web/lib/api/course-groups.ts
++++ b/Frontend/praxis-web/lib/api/course-groups.ts
+@@ -1,12 +1,16 @@
+ import { request, toQueryString } from "@/lib/api/http";
+-import type { CourseGroup } from "@/lib/types";
++import type { CourseGroup, CourseGroupStatus, PaginatedResult } from "@/lib/types";
+ 
+ export interface ListCourseGroupsParams {
+   courseId?: string;
++  page?: number;
++  limit?: number;
+ }
+ 
++// GET /course-groups is paginated on the backend (PaginatedResult<...>),
++// not a bare array — see CourseGroupsController.findPublished.
+ export function listCourseGroups(params?: ListCourseGroupsParams, next?: NextFetchRequestConfig) {
+-  return request<CourseGroup[]>(`/course-groups${toQueryString(params)}`, {
++  return request<PaginatedResult<CourseGroup>>(`/course-groups${toQueryString(params)}`, {
+     skipCredentials: true,
+     next: next ?? { revalidate: 60 },
+   });
+@@ -16,13 +20,18 @@ export function getCourseGroup(id: string, accessToken?: string) {
+   return request<CourseGroup>(`/course-groups/${id}`, { accessToken, skipCredentials: !accessToken });
+ }
+ 
++// Mirrors CreateCourseGroupDto exactly. There is no Telegram field on this
++// resource at all — a group is linked to a Telegram chat separately via
++// POST /telegram/admin/link-group (see lib/api/telegram.ts), because the
++// FK lives on the TelegramGroup row, not on CourseGroup.
+ export interface CourseGroupPayload {
+   courseId: string;
+-  title: string;
++  name: string;
+   startDate: string;
+-  endDate: string;
+-  capacity: number;
+-  telegramGroupChatId?: string;
++  endDate?: string;
++  schedule: string;
++  teacherId?: string;
++  capacity?: number;
+ }
+ 
+ export function createCourseGroup(payload: CourseGroupPayload, accessToken: string) {
+@@ -31,7 +40,7 @@ export function createCourseGroup(payload: CourseGroupPayload, accessToken: stri
+ 
+ export function updateCourseGroup(
+   id: string,
+-  payload: Partial<CourseGroupPayload> & { status?: CourseGroup["status"] },
++  payload: Partial<Omit<CourseGroupPayload, "courseId">> & { status?: CourseGroupStatus },
+   accessToken: string,
+ ) {
+   return request<CourseGroup>(`/course-groups/${id}`, { method: "PATCH", body: payload, accessToken });
+diff --git a/Frontend/praxis-web/lib/api/courses.ts b/Frontend/praxis-web/lib/api/courses.ts
+index 853a01e2..7db7958a 100644
+--- a/Frontend/praxis-web/lib/api/courses.ts
++++ b/Frontend/praxis-web/lib/api/courses.ts
+@@ -1,10 +1,16 @@
+ import { request, toQueryString } from "@/lib/api/http";
+-import type { Course, PaginatedResult } from "@/lib/types";
++import type { Course, CourseStatus, CourseTrack, PaginatedResult } from "@/lib/types";
+ 
++// Field names and pagination params mirror QueryCoursesDto exactly — the
++// backend's ValidationPipe runs with `forbidNonWhitelisted: true`, so any
++// property here that isn't in the DTO (e.g. a `pageSize` instead of
++// `limit`) gets the whole request rejected with a 400, not silently
++// ignored.
+ export interface ListCoursesParams {
+-  track?: string;
++  track?: CourseTrack;
++  search?: string;
+   page?: number;
+-  pageSize?: number;
++  limit?: number;
+ }
+ 
+ export function listCourses(params?: ListCoursesParams, next?: NextFetchRequestConfig) {
+@@ -21,16 +27,18 @@ export function getCourse(id: string, next?: NextFetchRequestConfig) {
+   });
+ }
+ 
++// Mirrors CreateCourseDto exactly. `slug` is optional (auto-derived from
++// `title` server-side when omitted); `currency`/`status` are optional and
++// default server-side to the course's base currency and DRAFT respectively.
+ export interface CoursePayload {
+   title: string;
+-  slug: string;
+-  track: string;
+-  summary: string;
++  slug?: string;
+   description: string;
+-  priceMinor: number;
+-  currency: string;
+-  durationWeeks: number;
+-  status: "DRAFT" | "PUBLISHED" | "ARCHIVED";
++  track: CourseTrack;
++  monthlyPrice: number;
++  currency?: string;
++  durationDays: number;
++  status?: CourseStatus;
+ }
+ 
+ export function createCourse(payload: CoursePayload, accessToken: string) {
+diff --git a/Frontend/praxis-web/lib/api/payments.ts b/Frontend/praxis-web/lib/api/payments.ts
+index c6e6d3fa..fe1a2c8f 100644
+--- a/Frontend/praxis-web/lib/api/payments.ts
++++ b/Frontend/praxis-web/lib/api/payments.ts
+@@ -1,25 +1,31 @@
+ import { request } from "@/lib/api/http";
+-import type { Payment } from "@/lib/types";
++import type { Order, Payment } from "@/lib/types";
+ 
+ export interface InitiatePaymentResult {
+-  redirectUrl: string;
+-  paymentId: string;
++  paymentUrl: string;
+ }
+ 
++// Route is POST /payments/initiate with `orderId` in the body — NOT
++// /payments/:orderId/initiate — see PaymentsController.initiate /
++// InitiatePaymentDto.
+ export function initiatePayment(orderId: string, accessToken: string) {
+-  return request<InitiatePaymentResult>(`/payments/${orderId}/initiate`, {
++  return request<InitiatePaymentResult>("/payments/initiate", {
+     method: "POST",
++    body: { orderId },
+     accessToken,
+   });
+ }
+ 
+ export interface PaymentStatusResult {
+-  status: Payment["status"];
+-  orderStatus: "PENDING" | "PAID" | "EXPIRED" | "CANCELLED" | "FAILED";
++  order: Order;
++  latestPayment: Payment | null;
+ }
+ 
+ // Polled by /payment/return since the ARCA webhook confirming payment can
+-// arrive slightly before or after the browser redirect completes.
++// arrive slightly before or after the browser redirect completes. Mirrors
++// PaymentsController.getStatus exactly — there is no separate top-level
++// `status`/`orderStatus` pair, just the order and its most recent payment
++// attempt (order.status is the source of truth for "did this succeed").
+ export function getPaymentStatus(orderId: string, accessToken: string) {
+   return request<PaymentStatusResult>(`/payments/${orderId}/status`, { accessToken });
+ }
+diff --git a/Frontend/praxis-web/lib/api/subscriptions.ts b/Frontend/praxis-web/lib/api/subscriptions.ts
+index 9130a02d..4ffaf892 100644
+--- a/Frontend/praxis-web/lib/api/subscriptions.ts
++++ b/Frontend/praxis-web/lib/api/subscriptions.ts
+@@ -1,12 +1,17 @@
+ import { request } from "@/lib/api/http";
+-import type { Subscription } from "@/lib/types";
++import type { Order, Subscription } from "@/lib/types";
+ 
+ export function listMySubscriptions(accessToken: string) {
+   return request<Subscription[]>("/subscriptions/me", { accessToken });
+ }
+ 
++// Renewing is NOT an instant state change — SubscriptionsController.renew
++// returns a new *Order* (CREATED, 201) that still has to be paid, exactly
++// like a first-time enrollment. Callers must take the returned order and
++// run it through the same initiatePayment()/redirect flow used for a fresh
++// purchase — see components/subscription/SubscriptionCard.tsx.
+ export function renewSubscription(id: string, accessToken: string) {
+-  return request<Subscription>(`/subscriptions/${id}/renew`, { method: "POST", accessToken });
++  return request<Order>(`/subscriptions/${id}/renew`, { method: "POST", accessToken });
+ }
+ 
+ export function cancelSubscription(id: string, accessToken: string) {
+diff --git a/Frontend/praxis-web/lib/api/telegram.ts b/Frontend/praxis-web/lib/api/telegram.ts
+index a86d861b..720b1ff0 100644
+--- a/Frontend/praxis-web/lib/api/telegram.ts
++++ b/Frontend/praxis-web/lib/api/telegram.ts
+@@ -6,11 +6,43 @@ export interface TelegramLinkResult {
+ }
+ 
+ // Requests a one-time /start <token> deep link. The bot links the account
+-// server-side once the student opens the link in Telegram.
++// server-side once the student opens the link in Telegram. Route is
++// /telegram/link/request, not /telegram/link.
+ export function requestTelegramLink(accessToken: string) {
+-  return request<TelegramLinkResult>("/telegram/link", { method: "POST", accessToken });
++  return request<TelegramLinkResult>("/telegram/link/request", {
++    method: "POST",
++    accessToken,
++  });
+ }
+ 
+-export function unlinkTelegram(accessToken: string) {
+-  return request<void>("/telegram/unlink", { method: "POST", accessToken });
++export interface TelegramLinkStatus {
++  linked: boolean;
++}
++
++// SafeUser carries no `telegramLinked` field — whether the current user is
++// linked has to be checked via this endpoint instead.
++export function getTelegramLinkStatus(accessToken: string) {
++  return request<TelegramLinkStatus>("/telegram/link/status", { accessToken });
++}
++
++// Note: there is no unlink endpoint on the backend today (TelegramController
++// only exposes link/request, link/status, and the admin link-group route).
++// A previous version of this client called a non-existent POST
++// /telegram/unlink, which always 404'd — removed rather than left pointing
++// at a route that doesn't exist. Add this back once/if the backend grows
++// a corresponding endpoint.
++
++export interface LinkTelegramGroupPayload {
++  courseGroupId: string;
++  /** Telegram chat id as a string (large negative integers for supergroups). */
++  telegramChatId: string;
++  title: string;
++}
++
++export function linkTelegramGroup(payload: LinkTelegramGroupPayload, accessToken: string) {
++  return request<{ id: string }>("/telegram/admin/link-group", {
++    method: "POST",
++    body: payload,
++    accessToken,
++  });
+ }
+diff --git a/Frontend/praxis-web/lib/types.ts b/Frontend/praxis-web/lib/types.ts
+index 01ee4545..422ef83d 100644
+--- a/Frontend/praxis-web/lib/types.ts
++++ b/Frontend/praxis-web/lib/types.ts
+@@ -1,105 +1,178 @@
+-// Mirrors praxis-api response shapes exactly. Money fields are integers in
+-// minor units (e.g. AMD cents) — never floats. Divide by 100 only at the
+-// display edge; never store or compare the divided value.
++// Mirrors praxis-api (Admin_Panel_Backend) response shapes exactly — see
++// the corresponding Prisma models / DTOs / response-mapper interfaces in
++// Admin_Panel_Backend/src for the source of truth each type below is
++// derived from. Money fields are integers in minor units (e.g. AMD cents)
++// — never floats. Divide by 100 only at the display edge (lib/money.ts);
++// never store or compare the divided value.
++//
++// Dates are typed as `string` (ISO 8601) throughout, matching what actually
++// arrives over JSON — the backend's `Date` fields are serialized to strings
++// by the time they reach the browser; there is no runtime `Date` here.
+ 
+ export type Role = "STUDENT" | "TEACHER" | "ADMIN";
+ 
++export type UserStatus = "ACTIVE" | "SUSPENDED" | "DELETED";
++
++export type CourseTrack = "FUNDAMENTALS" | "PROFESSION" | "COMBINED" | "MINI";
++
+ export type CourseStatus = "DRAFT" | "PUBLISHED" | "ARCHIVED";
+ 
+-export type CourseGroupStatus = "SCHEDULED" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
++export type CourseGroupStatus = "UPCOMING" | "ACTIVE" | "COMPLETED" | "CANCELLED";
++
++export type OrderStatus = "PENDING" | "PAID" | "EXPIRED" | "CANCELLED";
+ 
+-export type OrderStatus = "PENDING" | "PAID" | "EXPIRED" | "CANCELLED" | "FAILED";
++export type PaymentStatus =
++  | "INITIATED"
++  | "PENDING"
++  | "SUCCEEDED"
++  | "FAILED"
++  | "CANCELLED"
++  | "REFUNDED";
+ 
+ export type SubscriptionStatus = "PENDING" | "ACTIVE" | "EXPIRED" | "CANCELLED";
+ 
++// See Admin_Panel_Backend/src/users/interfaces/safe-user.interface.ts
++// (toSafeUser) — this is exactly what every endpoint returning a user
++// exposes, and nothing more.
+ export interface SafeUser {
+   id: string;
+   email: string;
+-  fullName: string;
++  name: string;
+   phone: string | null;
++  telegramUsername: string | null;
+   role: Role;
+-  isSuspended: boolean;
+-  telegramLinked: boolean;
++  status: UserStatus;
++  locale: string;
++  emailVerifiedAt: string | null;
+   createdAt: string;
++  updatedAt: string;
+ }
+ 
++// Raw Prisma `Course` row, as returned unmapped by CoursesController.
+ export interface Course {
+   id: string;
+-  title: string;
+   slug: string;
+-  track: string;
+-  summary: string;
++  title: string;
+   description: string;
+-  priceMinor: number;
++  track: CourseTrack;
++  monthlyPrice: number;
+   currency: string;
+-  durationWeeks: number;
++  durationDays: number;
+   status: CourseStatus;
+   createdAt: string;
+   updatedAt: string;
+ }
+ 
++// See Admin_Panel_Backend/src/course-groups/interfaces/course-group-response.interface.ts
++// (toCourseGroupResponse). Note there is no `enrolledCount` — the API does
++// not expose a live enrollment count for a course group.
+ export interface CourseGroup {
+   id: string;
+   courseId: string;
+-  title: string;
++  name: string;
+   startDate: string;
+-  endDate: string;
+-  capacity: number;
+-  enrolledCount: number;
++  endDate: string | null;
++  schedule: string;
++  teacherId: string | null;
++  capacity: number | null;
+   status: CourseGroupStatus;
+   telegramGroupId: string | null;
+   createdAt: string;
++  updatedAt: string;
+ }
+ 
++// Raw Prisma `Order` row, as returned unmapped by OrdersController.
+ export interface Order {
+   id: string;
+-  studentId: string;
++  orderNumber: string;
++  userId: string;
+   courseGroupId: string;
+-  amountMinor: number;
++  subscriptionId: string | null;
++  amount: number;
+   currency: string;
+   status: OrderStatus;
+-  expiresAt: string;
++  periodStart: string;
++  periodEnd: string;
++  description: string | null;
+   createdAt: string;
++  expiresAt: string | null;
++  cancelledAt: string | null;
+ }
+ 
++// Raw Prisma `Payment` row. `amount`/`currency` are NOT columns on this
++// model in the backend schema — they live on `Order` — so they're only
++// ever present here when the endpoint explicitly joins and flattens them
++// (see AdminStudentsController's payments endpoint). Treat as optional.
+ export interface Payment {
+   id: string;
+   orderId: string;
+   provider: string;
+-  providerReference: string | null;
+-  amountMinor: number;
+-  currency: string;
+-  status: "PENDING" | "SUCCEEDED" | "FAILED";
+-  createdAt: string;
++  providerOrderId: string;
++  status: PaymentStatus;
++  attemptNumber: number;
++  approvalCode: string | null;
++  rrn: string | null;
++  cardMask: string | null;
++  cardBrand: string | null;
++  failureCode: string | null;
++  failureMessage: string | null;
++  initiatedAt: string;
++  completedAt: string | null;
++  /** Flattened in from the related Order — see the admin payments endpoint. */
++  amount?: number;
++  /** Flattened in from the related Order — see the admin payments endpoint. */
++  currency?: string;
+ }
+ 
++// See Admin_Panel_Backend/src/subscriptions/interfaces/subscription-response.interface.ts
++// (toSubscriptionResponse).
+ export interface Subscription {
+   id: string;
+   studentId: string;
+-  courseId: string;
+   courseGroupId: string;
++  courseId: string;
+   status: SubscriptionStatus;
+-  startedAt: string | null;
+-  expiresAt: string | null;
++  startDate: string | null;
++  expireDate: string | null;
++  autoRenew: boolean;
++  cancelledAt: string | null;
+   createdAt: string;
+-  // Enriched client-side via lookups against /courses and /course-groups
++  updatedAt: string;
++  // Enriched client-side via lookups against /courses and /course-groups —
++  // the API response itself only carries ids.
+   courseTitle?: string;
+   courseGroupTitle?: string;
+ }
+ 
++// See Admin_Panel_Backend/src/admin/interfaces/dashboard-stats.interface.ts.
++export interface RevenueByCurrency {
++  currency: string;
++  amount: number;
++}
++
++export interface PopularCourse {
++  courseId: string;
++  title: string;
++  enrollmentCount: number;
++}
++
+ export interface DashboardStats {
+   totalStudents: number;
+   activeSubscriptions: number;
+-  pendingOrders: number;
+-  revenueMinorThisMonth: number;
+-  currency: string;
++  expiredSubscriptions: number;
++  monthlyRevenue: RevenueByCurrency[];
++  popularCourses: PopularCourse[];
+ }
+ 
++// See Admin_Panel_Backend/src/common/interfaces/paginated-result.interface.ts.
+ export interface PaginatedResult<T> {
+-  items: T[];
+-  total: number;
+-  page: number;
+-  pageSize: number;
++  data: T[];
++  meta: {
++    page: number;
++    limit: number;
++    total: number;
++    totalPages: number;
++  };
+ }
+ 
+ export interface ApiErrorBody {
+@@ -108,7 +181,9 @@ export interface ApiErrorBody {
+   error?: string;
+ }
+ 
++// /auth/register, /auth/login, /auth/refresh all return exactly
++// `{ user, accessToken }` — the refresh token itself is never in the JSON
++// body, only in the httpOnly cookie the backend sets alongside it.
+ export interface TokenPair {
+   accessToken: string;
+-  expiresIn: number;
+ }

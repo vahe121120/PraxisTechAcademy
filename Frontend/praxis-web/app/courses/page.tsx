@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { BookX } from "lucide-react";
 import { listCourses } from "@/lib/api/courses";
+import type { Course, CourseTrack } from "@/lib/types";
 import { CourseCard } from "@/components/course/CourseCard";
 import { TrackFilter } from "@/components/course/TrackFilter";
 import { EmptyState } from "@/components/ui/EmptyState";
@@ -14,11 +15,14 @@ interface CoursesPageProps {
 export default async function CoursesPage({ searchParams }: CoursesPageProps) {
   const { track } = await searchParams;
 
-  let courses: Awaited<ReturnType<typeof listCourses>>["items"] = [];
+  let courses: Course[] = [];
   let loadError = false;
   try {
-    const result = await listCourses({ track, pageSize: 50 });
-    courses = result.items;
+    // `track` comes straight off the URL and is whatever the visitor typed
+    // — the backend validates it against the real CourseTrack enum and
+    // 400s on anything else, which the catch below turns into loadError.
+    const result = await listCourses({ track: track as CourseTrack | undefined, limit: 50 });
+    courses = result.data;
   } catch {
     loadError = true;
   }

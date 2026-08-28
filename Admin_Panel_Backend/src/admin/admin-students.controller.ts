@@ -8,11 +8,12 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
-import { Payment, UserRole } from '@prisma/client';
+import { UserRole } from '@prisma/client';
 
 import { Roles } from '../auth/decorators/roles.decorator';
 import { RolesGuard } from '../auth/guards/roles.guard';
 import { PaginatedResult } from '../common/interfaces/paginated-result.interface';
+import { PaymentResponse } from '../payments/interfaces/payment-response.interface';
 import { PaymentsService } from '../payments/payments.service';
 import { SubscriptionResponse } from '../subscriptions/interfaces/subscription-response.interface';
 import { SubscriptionsService } from '../subscriptions/subscriptions.service';
@@ -54,7 +55,7 @@ export class AdminStudentsController {
   findPayments(
     @Param('id', ParseUUIDPipe) id: string,
     @Query() query: PaginationQueryDto,
-  ): Promise<PaginatedResult<Payment>> {
+  ): Promise<PaginatedResult<PaymentResponse>> {
     return this.paymentsService.findByUser(id, query.page, query.limit);
   }
 
