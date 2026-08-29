@@ -1,0 +1,2718 @@
+diff --git a/Admin_Panel_Backend/prisma/constraints.sql b/Admin_Panel_Backend/prisma/constraints.sql
+index c3fd7e5b..aa2f6a71 100644
+--- a/Admin_Panel_Backend/prisma/constraints.sql
++++ b/Admin_Panel_Backend/prisma/constraints.sql
+@@ -132,3 +132,17 @@ ALTER TABLE "telegram_access_grants"
+ -- code path that forgets to normalize).
+ ALTER TABLE "users"
+   ADD CONSTRAINT "chk_users_email_lowercase" CHECK ("email" = lower("email"));
++
++-- Course curriculum: module/topic ordering must be non-negative. The
++-- (course_id, position) / (module_id, position) UNIQUE indexes (declared
++-- directly in schema.prisma) already prevent two siblings sharing a
++-- position; this CHECK additionally rules out a negative position ever
++-- being written by a reorder bug.
++-- Already included inline in migration 20260829103000_add_course_curriculum
++-- for this pair — listed here too, per this file's own stated purpose, so
++-- the full constraint set stays discoverable in one place.
++ALTER TABLE "course_modules"
++  ADD CONSTRAINT "chk_course_modules_position_nonnegative" CHECK ("position" >= 0);
++
++ALTER TABLE "course_topics"
++  ADD CONSTRAINT "chk_course_topics_position_nonnegative" CHECK ("position" >= 0);
+diff --git a/Admin_Panel_Backend/prisma/migrations/20260829103000_add_course_curriculum/migration.sql b/Admin_Panel_Backend/prisma/migrations/20260829103000_add_course_curriculum/migration.sql
+new file mode 100644
+index 00000000..e7845340
+--- /dev/null
++++ b/Admin_Panel_Backend/prisma/migrations/20260829103000_add_course_curriculum/migration.sql
+@@ -0,0 +1,57 @@
++-- AlterTable
++ALTER TABLE "courses" ADD COLUMN     "target_audience" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
++ADD COLUMN     "learning_outcomes" TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[];
++
++-- CreateTable
++CREATE TABLE "course_modules" (
++    "id" UUID NOT NULL,
++    "course_id" UUID NOT NULL,
++    "title" VARCHAR(150) NOT NULL,
++    "description" TEXT NOT NULL,
++    "position" INTEGER NOT NULL,
++    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "updated_at" TIMESTAMP(3) NOT NULL,
++
++    CONSTRAINT "course_modules_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateTable
++CREATE TABLE "course_topics" (
++    "id" UUID NOT NULL,
++    "module_id" UUID NOT NULL,
++    "label" VARCHAR(200) NOT NULL,
++    "position" INTEGER NOT NULL,
++    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
++    "updated_at" TIMESTAMP(3) NOT NULL,
++
++    CONSTRAINT "course_topics_pkey" PRIMARY KEY ("id")
++);
++
++-- CreateIndex
++CREATE INDEX "course_modules_course_id_idx" ON "course_modules"("course_id");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "course_modules_course_id_position_key" ON "course_modules"("course_id", "position");
++
++-- CreateIndex
++CREATE INDEX "course_topics_module_id_idx" ON "course_topics"("module_id");
++
++-- CreateIndex
++CREATE UNIQUE INDEX "course_topics_module_id_position_key" ON "course_topics"("module_id", "position");
++
++-- AddForeignKey
++ALTER TABLE "course_modules" ADD CONSTRAINT "course_modules_course_id_fkey" FOREIGN KEY ("course_id") REFERENCES "courses"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++
++-- AddForeignKey
++ALTER TABLE "course_topics" ADD CONSTRAINT "course_topics_module_id_fkey" FOREIGN KEY ("module_id") REFERENCES "course_modules"("id") ON DELETE CASCADE ON UPDATE CASCADE;
++
++-- Supplementary CHECK constraints (position must be non-negative), matching
++-- the project's established pattern of hand-adding CHECKs that Prisma's
++-- schema language can't express — see prisma/constraints.sql, which this
++-- migration's constraints should also be appended to for the reasons
++-- documented there.
++ALTER TABLE "course_modules"
++  ADD CONSTRAINT "chk_course_modules_position_nonnegative" CHECK ("position" >= 0);
++
++ALTER TABLE "course_topics"
++  ADD CONSTRAINT "chk_course_topics_position_nonnegative" CHECK ("position" >= 0);
+diff --git a/Admin_Panel_Backend/prisma/schema.prisma b/Admin_Panel_Backend/prisma/schema.prisma
+index d931b750..42fd6259 100644
+--- a/Admin_Panel_Backend/prisma/schema.prisma
++++ b/Admin_Panel_Backend/prisma/schema.prisma
+@@ -300,13 +300,65 @@ model Course {
+   createdAt     DateTime      @default(now()) @map("created_at")
+   updatedAt     DateTime      @updatedAt @map("updated_at")
+ 
++  // Public-facing course-detail content. Kept as simple ordered string
++  // arrays (not their own tables) because they're short, flat, unordered-
++  // relative-to-each-other lists with no admin need for per-item editing
++  // metadata — unlike CourseModule/CourseTopic below, which need
++  // `position` ordering and are edited as discrete records.
++  targetAudience    String[] @default([]) @map("target_audience")
++  learningOutcomes  String[] @default([]) @map("learning_outcomes")
++
+   courseGroups CourseGroup[]
++  modules      CourseModule[]
+ 
+   @@index([track])
+   @@index([status])
+   @@map("courses")
+ }
+ 
++/// A section of a Course's curriculum ("Module 1 — Introduction to
++/// Programming"), ordered by `position`. Deleting a Course cascades to its
++/// modules — a module has no meaning detached from its course.
++model CourseModule {
++  id          String   @id @default(uuid()) @db.Uuid
++  courseId    String   @map("course_id") @db.Uuid
++  title       String   @db.VarChar(150)
++  description String
++  position    Int
++  createdAt   DateTime @default(now()) @map("created_at")
++  updatedAt   DateTime @updatedAt @map("updated_at")
++
++  course Course       @relation(fields: [courseId], references: [id], onDelete: Cascade)
++  topics CourseTopic[]
++
++  // A course's modules must have distinct, gap-free-in-intent ordering —
++  // enforced at the position level (exact contiguity is a service-layer
++  // concern on reorder, per the same pattern as CourseGroup's other
++  // ordering-sensitive fields elsewhere in this schema).
++  @@unique([courseId, position])
++  @@index([courseId])
++  @@map("course_modules")
++}
++
++/// A single bullet-point topic within a CourseModule ("Variables", "Loops").
++/// Deliberately just a label + position — topics are display-only content,
++/// not a place for per-topic metadata (that would belong on CourseModule
++/// or a future lesson-level model instead).
++model CourseTopic {
++  id        String   @id @default(uuid()) @db.Uuid
++  moduleId  String   @map("module_id") @db.Uuid
++  label     String   @db.VarChar(200)
++  position  Int
++  createdAt DateTime @default(now()) @map("created_at")
++  updatedAt DateTime @updatedAt @map("updated_at")
++
++  module CourseModule @relation(fields: [moduleId], references: [id], onDelete: Cascade)
++
++  @@unique([moduleId, position])
++  @@index([moduleId])
++  @@map("course_topics")
++}
++
+ /// A scheduled live run of a Course, e.g. "QA Automation September 2026".
+ /// This is what students actually enroll in, not the Course itself, because
+ /// dates, schedule, teacher, and the Telegram group are all specific to one
+diff --git a/Admin_Panel_Backend/src/app.module.ts b/Admin_Panel_Backend/src/app.module.ts
+index bd4a0a4b..c91214f1 100644
+--- a/Admin_Panel_Backend/src/app.module.ts
++++ b/Admin_Panel_Backend/src/app.module.ts
+@@ -13,6 +13,7 @@ import { HealthModule } from './health/health.module';
+ import { PrismaModule } from './prisma/prisma.module';
+ import { AuthModule } from './auth/auth.module';
+ import { CoursesModule } from './courses/courses.module';
++import { CourseModulesModule } from './course-modules/course-modules.module';
+ import { CourseGroupsModule } from './course-groups/course-groups.module';
+ import { OrdersModule } from './orders/orders.module';
+ import { PaymentsModule } from './payments/payments.module';
+@@ -37,6 +38,7 @@ import { AdminModule } from './admin/admin.module';
+     HealthModule,
+     AuthModule,
+     CoursesModule,
++    CourseModulesModule,
+     CourseGroupsModule,
+     OrdersModule,
+     PaymentsModule,
+diff --git a/Admin_Panel_Backend/src/course-modules/course-modules.controller.ts b/Admin_Panel_Backend/src/course-modules/course-modules.controller.ts
+new file mode 100644
+index 00000000..bae54451
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/course-modules.controller.ts
+@@ -0,0 +1,62 @@
++import {
++  Body,
++  Controller,
++  Delete,
++  HttpCode,
++  HttpStatus,
++  Param,
++  ParseUUIDPipe,
++  Patch,
++  Post,
++  UseGuards,
++} from '@nestjs/common';
++import { UserRole } from '@prisma/client';
++
++import { Roles } from '../auth/decorators/roles.decorator';
++import { RolesGuard } from '../auth/guards/roles.guard';
++import { CourseModulesService, CourseModuleWithTopics } from './course-modules.service';
++import { CreateCourseModuleDto } from './dto/create-course-module.dto';
++import { ReorderCourseModulesDto } from './dto/reorder-course-modules.dto';
++import { UpdateCourseModuleDto } from './dto/update-course-module.dto';
++
++/**
++ * Admin-only curriculum management. Every route here requires ADMIN — there
++ * is no student-facing endpoint in this controller; students read
++ * curriculum through GET /courses/:id (CoursesController), which already
++ * eager-loads modules/topics ordered by position.
++ *
++ * Route ordering matters: the literal 'reorder' segment is registered
++ * before ':id' for the same reason documented in CoursesController — so it
++ * is never swallowed by the generic id route.
++ */
++@Roles(UserRole.ADMIN)
++@UseGuards(RolesGuard)
++@Controller({ path: 'course-modules', version: '1' })
++export class CourseModulesController {
++  constructor(private readonly courseModulesService: CourseModulesService) {}
++
++  @Post()
++  @HttpCode(HttpStatus.CREATED)
++  create(@Body() dto: CreateCourseModuleDto): Promise<CourseModuleWithTopics> {
++    return this.courseModulesService.createModule(dto);
++  }
++
++  @Patch('reorder')
++  reorder(@Body() dto: ReorderCourseModulesDto): Promise<CourseModuleWithTopics[]> {
++    return this.courseModulesService.reorderModules(dto);
++  }
++
++  @Patch(':id')
++  update(
++    @Param('id', ParseUUIDPipe) id: string,
++    @Body() dto: UpdateCourseModuleDto,
++  ): Promise<CourseModuleWithTopics> {
++    return this.courseModulesService.updateModule(id, dto);
++  }
++
++  @Delete(':id')
++  @HttpCode(HttpStatus.NO_CONTENT)
++  remove(@Param('id', ParseUUIDPipe) id: string): Promise<void> {
++    return this.courseModulesService.removeModule(id);
++  }
++}
+diff --git a/Admin_Panel_Backend/src/course-modules/course-modules.module.ts b/Admin_Panel_Backend/src/course-modules/course-modules.module.ts
+new file mode 100644
+index 00000000..d5ca93e8
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/course-modules.module.ts
+@@ -0,0 +1,17 @@
++import { Module } from '@nestjs/common';
++
++import { CoursesModule } from '../courses/courses.module';
++import { CourseModulesController } from './course-modules.controller';
++import { CourseModulesService } from './course-modules.service';
++import { CourseTopicsController } from './course-topics.controller';
++
++@Module({
++  // CoursesModule is imported (not just its service reached into) so
++  // CourseModulesService can inject CoursesService for
++  // assertCourseExists — the standard Nest way to reuse another feature
++  // module's exported provider.
++  imports: [CoursesModule],
++  controllers: [CourseModulesController, CourseTopicsController],
++  providers: [CourseModulesService],
++})
++export class CourseModulesModule {}
+diff --git a/Admin_Panel_Backend/src/course-modules/course-modules.service.ts b/Admin_Panel_Backend/src/course-modules/course-modules.service.ts
+new file mode 100644
+index 00000000..14773e0c
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/course-modules.service.ts
+@@ -0,0 +1,225 @@
++import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
++import { CourseModule as CourseModuleModel, CourseTopic } from '@prisma/client';
++
++import { CoursesService } from '../courses/courses.service';
++import { PrismaService } from '../prisma/prisma.service';
++import { CreateCourseModuleDto } from './dto/create-course-module.dto';
++import { CreateCourseTopicDto } from './dto/create-course-topic.dto';
++import { ReorderCourseModulesDto } from './dto/reorder-course-modules.dto';
++import { ReorderCourseTopicsDto } from './dto/reorder-course-topics.dto';
++import { UpdateCourseModuleDto } from './dto/update-course-module.dto';
++import { UpdateCourseTopicDto } from './dto/update-course-topic.dto';
++
++// Reordering has to move every affected row through a position it doesn't
++// currently occupy, but (courseId, position) / (moduleId, position) are
++// UNIQUE — updating rows one at a time in the new order can transiently
++// collide with a sibling that hasn't been moved yet. Offsetting everything
++// well past any realistic item count first, then assigning the final
++// 0..n-1 positions, guarantees no UNIQUE violation at any intermediate
++// step without needing deferrable constraints (which the migration didn't
++// declare). 100_000 comfortably exceeds ArrayMaxSize(100)/(200) on the
++// reorder DTOs.
++const REORDER_OFFSET = 100_000;
++
++export type CourseModuleWithTopics = CourseModuleModel & { topics: CourseTopic[] };
++
++@Injectable()
++export class CourseModulesService {
++  constructor(
++    private readonly prisma: PrismaService,
++    private readonly coursesService: CoursesService,
++  ) {}
++
++  // ---------------------------------------------------------------------
++  // Modules
++  // ---------------------------------------------------------------------
++
++  async createModule(dto: CreateCourseModuleDto): Promise<CourseModuleWithTopics> {
++    await this.coursesService.assertCourseExists(dto.courseId);
++
++    return this.prisma.$transaction(async (tx) => {
++      const last = await tx.courseModule.findFirst({
++        where: { courseId: dto.courseId },
++        orderBy: { position: 'desc' },
++        select: { position: true },
++      });
++
++      return tx.courseModule.create({
++        data: {
++          courseId: dto.courseId,
++          title: dto.title,
++          description: dto.description,
++          position: (last?.position ?? -1) + 1,
++        },
++        include: { topics: true },
++      });
++    });
++  }
++
++  async updateModule(id: string, dto: UpdateCourseModuleDto): Promise<CourseModuleWithTopics> {
++    if (Object.keys(dto).length === 0) {
++      throw new BadRequestException('At least one field must be provided to update the module.');
++    }
++    await this.assertModuleExists(id);
++
++    return this.prisma.courseModule.update({
++      where: { id },
++      data: {
++        ...(dto.title !== undefined ? { title: dto.title } : {}),
++        ...(dto.description !== undefined ? { description: dto.description } : {}),
++      },
++      include: { topics: { orderBy: { position: 'asc' } } },
++    });
++  }
++
++  async removeModule(id: string): Promise<void> {
++    await this.assertModuleExists(id); // 404s cleanly; topics cascade at the DB level
++    await this.prisma.courseModule.delete({ where: { id } });
++  }
++
++  async reorderModules(dto: ReorderCourseModulesDto): Promise<CourseModuleWithTopics[]> {
++    await this.coursesService.assertCourseExists(dto.courseId);
++
++    return this.prisma.$transaction(async (tx) => {
++      const existing = await tx.courseModule.findMany({
++        where: { courseId: dto.courseId },
++        select: { id: true },
++      });
++      this.assertExactSetMatch(
++        existing.map((m) => m.id),
++        dto.moduleIds,
++        'module',
++      );
++
++      // Phase 1: push every row well clear of the 0..n-1 range this
++      // course's modules are about to occupy, so phase 2 can never collide
++      // with a not-yet-updated sibling.
++      await tx.courseModule.updateMany({
++        where: { courseId: dto.courseId },
++        data: { position: { increment: REORDER_OFFSET } },
++      });
++
++      // Phase 2: assign the final, gap-free ordering.
++      await Promise.all(
++        dto.moduleIds.map((moduleId, index) =>
++          tx.courseModule.update({ where: { id: moduleId }, data: { position: index } }),
++        ),
++      );
++
++      return tx.courseModule.findMany({
++        where: { courseId: dto.courseId },
++        orderBy: { position: 'asc' },
++        include: { topics: { orderBy: { position: 'asc' } } },
++      });
++    });
++  }
++
++  // ---------------------------------------------------------------------
++  // Topics
++  // ---------------------------------------------------------------------
++
++  async createTopic(dto: CreateCourseTopicDto): Promise<CourseTopic> {
++    await this.assertModuleExists(dto.moduleId);
++
++    return this.prisma.$transaction(async (tx) => {
++      const last = await tx.courseTopic.findFirst({
++        where: { moduleId: dto.moduleId },
++        orderBy: { position: 'desc' },
++        select: { position: true },
++      });
++
++      return tx.courseTopic.create({
++        data: { moduleId: dto.moduleId, label: dto.label, position: (last?.position ?? -1) + 1 },
++      });
++    });
++  }
++
++  async updateTopic(id: string, dto: UpdateCourseTopicDto): Promise<CourseTopic> {
++    await this.assertTopicExists(id);
++    return this.prisma.courseTopic.update({ where: { id }, data: { label: dto.label } });
++  }
++
++  async removeTopic(id: string): Promise<void> {
++    await this.assertTopicExists(id);
++    await this.prisma.courseTopic.delete({ where: { id } });
++  }
++
++  async reorderTopics(dto: ReorderCourseTopicsDto): Promise<CourseTopic[]> {
++    await this.assertModuleExists(dto.moduleId);
++
++    return this.prisma.$transaction(async (tx) => {
++      const existing = await tx.courseTopic.findMany({
++        where: { moduleId: dto.moduleId },
++        select: { id: true },
++      });
++      this.assertExactSetMatch(
++        existing.map((t) => t.id),
++        dto.topicIds,
++        'topic',
++      );
++
++      await tx.courseTopic.updateMany({
++        where: { moduleId: dto.moduleId },
++        data: { position: { increment: REORDER_OFFSET } },
++      });
++
++      await Promise.all(
++        dto.topicIds.map((topicId, index) =>
++          tx.courseTopic.update({ where: { id: topicId }, data: { position: index } }),
++        ),
++      );
++
++      return tx.courseTopic.findMany({
++        where: { moduleId: dto.moduleId },
++        orderBy: { position: 'asc' },
++      });
++    });
++  }
++
++  // ---------------------------------------------------------------------
++  // Internal helpers
++  // ---------------------------------------------------------------------
++
++  private async assertModuleExists(id: string): Promise<void> {
++    const exists = await this.prisma.courseModule.findUnique({
++      where: { id },
++      select: { id: true },
++    });
++    if (!exists) {
++      throw new NotFoundException('Course module not found.');
++    }
++  }
++
++  private async assertTopicExists(id: string): Promise<void> {
++    const exists = await this.prisma.courseTopic.findUnique({
++      where: { id },
++      select: { id: true },
++    });
++    if (!exists) {
++      throw new NotFoundException('Course topic not found.');
++    }
++  }
++
++  /**
++   * A reorder submission must be a permutation of exactly the existing
++   * rows — not a superset, subset, or a set containing an id from a
++   * different course/module. Silently accepting a partial list would leave
++   * the omitted row's position undefined relative to the rest; silently
++   * ignoring an extra id would hide a client bug. Both fail loudly instead.
++   */
++  private assertExactSetMatch(existingIds: string[], submittedIds: string[], noun: string): void {
++    const existingSet = new Set(existingIds);
++    const submittedSet = new Set(submittedIds);
++
++    if (existingSet.size !== submittedSet.size) {
++      throw new BadRequestException(
++        `Expected exactly the ${existingSet.size} existing ${noun}(s), got ${submittedSet.size}.`,
++      );
++    }
++    for (const id of submittedSet) {
++      if (!existingSet.has(id)) {
++        throw new BadRequestException(`${id} is not a ${noun} of this parent.`);
++      }
++    }
++  }
++}
+diff --git a/Admin_Panel_Backend/src/course-modules/course-topics.controller.ts b/Admin_Panel_Backend/src/course-modules/course-topics.controller.ts
+new file mode 100644
+index 00000000..dbe2ac75
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/course-topics.controller.ts
+@@ -0,0 +1,52 @@
++import {
++  Body,
++  Controller,
++  Delete,
++  HttpCode,
++  HttpStatus,
++  Param,
++  ParseUUIDPipe,
++  Patch,
++  Post,
++  UseGuards,
++} from '@nestjs/common';
++import { CourseTopic, UserRole } from '@prisma/client';
++
++import { Roles } from '../auth/decorators/roles.decorator';
++import { RolesGuard } from '../auth/guards/roles.guard';
++import { CourseModulesService } from './course-modules.service';
++import { CreateCourseTopicDto } from './dto/create-course-topic.dto';
++import { ReorderCourseTopicsDto } from './dto/reorder-course-topics.dto';
++import { UpdateCourseTopicDto } from './dto/update-course-topic.dto';
++
++@Roles(UserRole.ADMIN)
++@UseGuards(RolesGuard)
++@Controller({ path: 'course-topics', version: '1' })
++export class CourseTopicsController {
++  constructor(private readonly courseModulesService: CourseModulesService) {}
++
++  @Post()
++  @HttpCode(HttpStatus.CREATED)
++  create(@Body() dto: CreateCourseTopicDto): Promise<CourseTopic> {
++    return this.courseModulesService.createTopic(dto);
++  }
++
++  @Patch('reorder')
++  reorder(@Body() dto: ReorderCourseTopicsDto): Promise<CourseTopic[]> {
++    return this.courseModulesService.reorderTopics(dto);
++  }
++
++  @Patch(':id')
++  update(
++    @Param('id', ParseUUIDPipe) id: string,
++    @Body() dto: UpdateCourseTopicDto,
++  ): Promise<CourseTopic> {
++    return this.courseModulesService.updateTopic(id, dto);
++  }
++
++  @Delete(':id')
++  @HttpCode(HttpStatus.NO_CONTENT)
++  remove(@Param('id', ParseUUIDPipe) id: string): Promise<void> {
++    return this.courseModulesService.removeTopic(id);
++  }
++}
+diff --git a/Admin_Panel_Backend/src/course-modules/dto/create-course-module.dto.ts b/Admin_Panel_Backend/src/course-modules/dto/create-course-module.dto.ts
+new file mode 100644
+index 00000000..fae4fa58
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/dto/create-course-module.dto.ts
+@@ -0,0 +1,24 @@
++import { Transform } from 'class-transformer';
++import { IsString, IsUUID, Length } from 'class-validator';
++
++export class CreateCourseModuleDto {
++  @IsUUID('4', { message: 'courseId must be a valid course id' })
++  courseId!: string;
++
++  @IsString()
++  @Length(2, 150, { message: 'title must be between 2 and 150 characters' })
++  @Transform(({ value }: { value: string }) => value?.trim())
++  title!: string;
++
++  @IsString()
++  @Length(2, 2000, { message: 'description must be between 2 and 2000 characters' })
++  @Transform(({ value }: { value: string }) => value?.trim())
++  description!: string;
++
++  // Intentionally no `position` field here — a new module is always
++  // appended at the end (service computes max(position)+1). Reordering is
++  // a dedicated, explicit action (PATCH /course-modules/reorder) rather
++  // than something a caller can accidentally trigger by guessing a number
++  // on create, which would risk colliding with the (courseId, position)
++  // unique constraint.
++}
+diff --git a/Admin_Panel_Backend/src/course-modules/dto/create-course-topic.dto.ts b/Admin_Panel_Backend/src/course-modules/dto/create-course-topic.dto.ts
+new file mode 100644
+index 00000000..70d86a57
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/dto/create-course-topic.dto.ts
+@@ -0,0 +1,12 @@
++import { Transform } from 'class-transformer';
++import { IsString, IsUUID, Length } from 'class-validator';
++
++export class CreateCourseTopicDto {
++  @IsUUID('4', { message: 'moduleId must be a valid module id' })
++  moduleId!: string;
++
++  @IsString()
++  @Length(2, 200, { message: 'label must be between 2 and 200 characters' })
++  @Transform(({ value }: { value: string }) => value?.trim())
++  label!: string;
++}
+diff --git a/Admin_Panel_Backend/src/course-modules/dto/reorder-course-modules.dto.ts b/Admin_Panel_Backend/src/course-modules/dto/reorder-course-modules.dto.ts
+new file mode 100644
+index 00000000..6a96826c
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/dto/reorder-course-modules.dto.ts
+@@ -0,0 +1,17 @@
++import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsUUID } from 'class-validator';
++
++export class ReorderCourseModulesDto {
++  @IsUUID('4', { message: 'courseId must be a valid course id' })
++  courseId!: string;
++
++  // The full, final ordering of module ids for this course, in the order
++  // they should appear. The service rejects any submission whose id set
++  // doesn't exactly match the course's existing modules — a partial list
++  // (a module accidentally dropped by the client) would otherwise silently
++  // strand that module without a well-defined position.
++  @IsUUID('4', { each: true, message: 'moduleIds must all be valid module ids' })
++  @ArrayMinSize(1)
++  @ArrayMaxSize(100)
++  @ArrayUnique()
++  moduleIds!: string[];
++}
+diff --git a/Admin_Panel_Backend/src/course-modules/dto/reorder-course-topics.dto.ts b/Admin_Panel_Backend/src/course-modules/dto/reorder-course-topics.dto.ts
+new file mode 100644
+index 00000000..3fb1f50c
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/dto/reorder-course-topics.dto.ts
+@@ -0,0 +1,12 @@
++import { ArrayMaxSize, ArrayMinSize, ArrayUnique, IsUUID } from 'class-validator';
++
++export class ReorderCourseTopicsDto {
++  @IsUUID('4', { message: 'moduleId must be a valid module id' })
++  moduleId!: string;
++
++  @IsUUID('4', { each: true, message: 'topicIds must all be valid topic ids' })
++  @ArrayMinSize(1)
++  @ArrayMaxSize(200)
++  @ArrayUnique()
++  topicIds!: string[];
++}
+diff --git a/Admin_Panel_Backend/src/course-modules/dto/update-course-module.dto.ts b/Admin_Panel_Backend/src/course-modules/dto/update-course-module.dto.ts
+new file mode 100644
+index 00000000..93352f27
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/dto/update-course-module.dto.ts
+@@ -0,0 +1,16 @@
++import { Transform } from 'class-transformer';
++import { IsOptional, IsString, Length } from 'class-validator';
++
++export class UpdateCourseModuleDto {
++  @IsOptional()
++  @IsString()
++  @Length(2, 150, { message: 'title must be between 2 and 150 characters' })
++  @Transform(({ value }: { value: string }) => value?.trim())
++  title?: string;
++
++  @IsOptional()
++  @IsString()
++  @Length(2, 2000, { message: 'description must be between 2 and 2000 characters' })
++  @Transform(({ value }: { value: string }) => value?.trim())
++  description?: string;
++}
+diff --git a/Admin_Panel_Backend/src/course-modules/dto/update-course-topic.dto.ts b/Admin_Panel_Backend/src/course-modules/dto/update-course-topic.dto.ts
+new file mode 100644
+index 00000000..a88dae8a
+--- /dev/null
++++ b/Admin_Panel_Backend/src/course-modules/dto/update-course-topic.dto.ts
+@@ -0,0 +1,9 @@
++import { Transform } from 'class-transformer';
++import { IsString, Length } from 'class-validator';
++
++export class UpdateCourseTopicDto {
++  @IsString()
++  @Length(2, 200, { message: 'label must be between 2 and 200 characters' })
++  @Transform(({ value }: { value: string }) => value?.trim())
++  label!: string;
++}
+diff --git a/Admin_Panel_Backend/src/courses/courses.controller.ts b/Admin_Panel_Backend/src/courses/courses.controller.ts
+index 46baff24..ad1fecef 100644
+--- a/Admin_Panel_Backend/src/courses/courses.controller.ts
++++ b/Admin_Panel_Backend/src/courses/courses.controller.ts
+@@ -18,7 +18,7 @@ import { Public } from '../auth/decorators/public.decorator';
+ import { Roles } from '../auth/decorators/roles.decorator';
+ import { RolesGuard } from '../auth/guards/roles.guard';
+ import { PaginatedResult } from '../common/interfaces/paginated-result.interface';
+-import { CoursesService } from './courses.service';
++import { CoursesService, CourseWithCurriculum } from './courses.service';
+ import { AdminQueryCoursesDto } from './dto/admin-query-courses.dto';
+ import { CreateCourseDto } from './dto/create-course.dto';
+ import { QueryCoursesDto } from './dto/query-courses.dto';
+@@ -53,7 +53,7 @@ export class CoursesController {
+   @Roles(UserRole.ADMIN)
+   @UseGuards(RolesGuard)
+   @Get('admin/:id')
+-  findOneAdmin(@Param('id', ParseUUIDPipe) id: string): Promise<Course> {
++  findOneAdmin(@Param('id', ParseUUIDPipe) id: string): Promise<CourseWithCurriculum> {
+     return this.coursesService.findOneAdmin(id);
+   }
+ 
+@@ -87,7 +87,7 @@ export class CoursesController {
+ 
+   @Public()
+   @Get(':id')
+-  findOnePublished(@Param('id', ParseUUIDPipe) id: string): Promise<Course> {
++  findOnePublished(@Param('id', ParseUUIDPipe) id: string): Promise<CourseWithCurriculum> {
+     return this.coursesService.findOnePublished(id);
+   }
+ }
+diff --git a/Admin_Panel_Backend/src/courses/courses.service.ts b/Admin_Panel_Backend/src/courses/courses.service.ts
+index e21e2e45..a85e5b3b 100644
+--- a/Admin_Panel_Backend/src/courses/courses.service.ts
++++ b/Admin_Panel_Backend/src/courses/courses.service.ts
+@@ -4,7 +4,7 @@ import {
+   Injectable,
+   NotFoundException,
+ } from '@nestjs/common';
+-import { Course, CourseStatus, Currency, Prisma } from '@prisma/client';
++import { Course, CourseModule, CourseStatus, CourseTopic, Currency, Prisma } from '@prisma/client';
+ 
+ import { PaginatedResult } from '../common/interfaces/paginated-result.interface';
+ import { PrismaService } from '../prisma/prisma.service';
+@@ -16,6 +16,22 @@ import { slugify } from './utils/slugify';
+ 
+ const DEFAULT_CURRENCY: Currency = Currency.AMD;
+ 
++// The detail reads (findOnePublished/findOneAdmin) return the curriculum
++// eagerly, ordered by `position` at both levels — the list/paginate reads
++// deliberately stay plain `Course` (no modules) since a catalog card never
++// needs the full curriculum and fetching it for every row in a paginated
++// list would be wasted work.
++export type CourseWithCurriculum = Course & {
++  modules: (CourseModule & { topics: CourseTopic[] })[];
++};
++
++const CURRICULUM_INCLUDE = {
++  modules: {
++    orderBy: { position: 'asc' as const },
++    include: { topics: { orderBy: { position: 'asc' as const } } },
++  },
++} satisfies Prisma.CourseInclude;
++
+ @Injectable()
+ export class CoursesService {
+   constructor(private readonly prisma: PrismaService) {}
+@@ -41,9 +57,10 @@ export class CoursesService {
+    * signal; "not found" is both more honest from the client's perspective
+    * and doesn't leak the catalog's unpublished contents.
+    */
+-  async findOnePublished(id: string): Promise<Course> {
++  async findOnePublished(id: string): Promise<CourseWithCurriculum> {
+     const course = await this.prisma.course.findFirst({
+       where: { id, status: CourseStatus.PUBLISHED },
++      include: CURRICULUM_INCLUDE,
+     });
+ 
+     if (!course) {
+@@ -67,8 +84,11 @@ export class CoursesService {
+     return this.paginate(where, query.page ?? 1, query.limit ?? 20);
+   }
+ 
+-  async findOneAdmin(id: string): Promise<Course> {
+-    const course = await this.prisma.course.findUnique({ where: { id } });
++  async findOneAdmin(id: string): Promise<CourseWithCurriculum> {
++    const course = await this.prisma.course.findUnique({
++      where: { id },
++      include: CURRICULUM_INCLUDE,
++    });
+     if (!course) {
+       throw new NotFoundException('Course not found.');
+     }
+@@ -93,6 +113,8 @@ export class CoursesService {
+         currency: dto.currency ?? DEFAULT_CURRENCY,
+         durationDays: dto.durationDays,
+         status: dto.status ?? CourseStatus.DRAFT,
++        targetAudience: dto.targetAudience ?? [],
++        learningOutcomes: dto.learningOutcomes ?? [],
+       },
+     });
+   }
+@@ -102,7 +124,7 @@ export class CoursesService {
+       throw new BadRequestException('At least one field must be provided to update the course.');
+     }
+ 
+-    await this.findOneAdmin(id); // 404s cleanly if the course doesn't exist
++    await this.assertCourseExists(id);
+ 
+     if (dto.slug) {
+       await this.assertSlugAvailable(dto.slug, id);
+@@ -119,12 +141,14 @@ export class CoursesService {
+         ...(dto.currency !== undefined ? { currency: dto.currency } : {}),
+         ...(dto.durationDays !== undefined ? { durationDays: dto.durationDays } : {}),
+         ...(dto.status !== undefined ? { status: dto.status } : {}),
++        ...(dto.targetAudience !== undefined ? { targetAudience: dto.targetAudience } : {}),
++        ...(dto.learningOutcomes !== undefined ? { learningOutcomes: dto.learningOutcomes } : {}),
+       },
+     });
+   }
+ 
+   async remove(id: string): Promise<void> {
+-    await this.findOneAdmin(id); // 404s cleanly if the course doesn't exist
++    await this.assertCourseExists(id); // 404s cleanly if the course doesn't exist
+ 
+     const groupCount = await this.prisma.courseGroup.count({ where: { courseId: id } });
+     if (groupCount > 0) {
+@@ -151,6 +175,20 @@ export class CoursesService {
+     }
+   }
+ 
++  /**
++   * Lightweight existence check (no curriculum join) — used wherever a
++   * caller only needs a clean 404 rather than the full course record. Also
++   * used by CourseModulesService so creating a module against a
++   * nonexistent courseId 404s with the same message instead of tripping
++   * the FK constraint with a raw P2003.
++   */
++  async assertCourseExists(id: string): Promise<void> {
++    const exists = await this.prisma.course.findUnique({ where: { id }, select: { id: true } });
++    if (!exists) {
++      throw new NotFoundException('Course not found.');
++    }
++  }
++
+   private async paginate(
+     where: Prisma.CourseWhereInput,
+     page: number,
+diff --git a/Admin_Panel_Backend/src/courses/dto/create-course.dto.ts b/Admin_Panel_Backend/src/courses/dto/create-course.dto.ts
+index 18a31413..0a47f5df 100644
+--- a/Admin_Panel_Backend/src/courses/dto/create-course.dto.ts
++++ b/Admin_Panel_Backend/src/courses/dto/create-course.dto.ts
+@@ -1,6 +1,17 @@
+ import { CourseStatus, CourseTrack, Currency } from '@prisma/client';
+ import { Transform } from 'class-transformer';
+-import { IsEnum, IsInt, IsOptional, IsString, Length, Matches, Max, Min } from 'class-validator';
++import {
++  ArrayMaxSize,
++  IsArray,
++  IsEnum,
++  IsInt,
++  IsOptional,
++  IsString,
++  Length,
++  Matches,
++  Max,
++  Min,
++} from 'class-validator';
+ 
+ const SLUG_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+ 
+@@ -55,4 +66,24 @@ export class CreateCourseDto {
+   @IsOptional()
+   @IsEnum(CourseStatus)
+   status?: CourseStatus;
++
++  // Short, flat, public-facing lists — see the schema comment on
++  // Course.targetAudience for why these are plain string arrays rather
++  // than their own tables (unlike CourseModule/CourseTopic, which do need
++  // per-item ordering and admin CRUD).
++  @IsOptional()
++  @IsArray()
++  @ArrayMaxSize(8, { message: 'targetAudience can have at most 8 entries' })
++  @IsString({ each: true })
++  @Length(2, 150, { each: true })
++  @Transform(({ value }: { value: string[] }) => value?.map((v) => v?.trim()).filter(Boolean))
++  targetAudience?: string[];
++
++  @IsOptional()
++  @IsArray()
++  @ArrayMaxSize(20, { message: 'learningOutcomes can have at most 20 entries' })
++  @IsString({ each: true })
++  @Length(2, 200, { each: true })
++  @Transform(({ value }: { value: string[] }) => value?.map((v) => v?.trim()).filter(Boolean))
++  learningOutcomes?: string[];
+ }
+diff --git a/Admin_Panel_Backend/src/courses/dto/update-course.dto.ts b/Admin_Panel_Backend/src/courses/dto/update-course.dto.ts
+index 58c9a70f..0331ca4d 100644
+--- a/Admin_Panel_Backend/src/courses/dto/update-course.dto.ts
++++ b/Admin_Panel_Backend/src/courses/dto/update-course.dto.ts
+@@ -1,6 +1,17 @@
+ import { CourseStatus, CourseTrack, Currency } from '@prisma/client';
+ import { Transform } from 'class-transformer';
+-import { IsEnum, IsInt, IsOptional, IsString, Length, Matches, Max, Min } from 'class-validator';
++import {
++  ArrayMaxSize,
++  IsArray,
++  IsEnum,
++  IsInt,
++  IsOptional,
++  IsString,
++  Length,
++  Matches,
++  Max,
++  Min,
++} from 'class-validator';
+ 
+ const SLUG_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+ 
+@@ -50,4 +61,20 @@ export class UpdateCourseDto {
+   @IsOptional()
+   @IsEnum(CourseStatus)
+   status?: CourseStatus;
++
++  @IsOptional()
++  @IsArray()
++  @ArrayMaxSize(8, { message: 'targetAudience can have at most 8 entries' })
++  @IsString({ each: true })
++  @Length(2, 150, { each: true })
++  @Transform(({ value }: { value: string[] }) => value?.map((v) => v?.trim()).filter(Boolean))
++  targetAudience?: string[];
++
++  @IsOptional()
++  @IsArray()
++  @ArrayMaxSize(20, { message: 'learningOutcomes can have at most 20 entries' })
++  @IsString({ each: true })
++  @Length(2, 200, { each: true })
++  @Transform(({ value }: { value: string[] }) => value?.map((v) => v?.trim()).filter(Boolean))
++  learningOutcomes?: string[];
+ }
+diff --git a/Frontend/praxis-web/.env.example b/Frontend/praxis-web/.env.example
+index 01087018..9bf9c165 100644
+--- a/Frontend/praxis-web/.env.example
++++ b/Frontend/praxis-web/.env.example
+@@ -1,2 +1,10 @@
+ # Base URL of praxis-api, no trailing slash.
+ NEXT_PUBLIC_API_URL=http://localhost:3001
++
++# Official Praxis Tech Academy Telegram contact for pre-payment questions
++# (no leading "@"). This is a support/contact channel, distinct from the
++# per-cohort Telegram *access* group students are invited to after payment
++# (lib/api/telegram.ts) — see the "Ask About This Course" CTA on the course
++# detail page. Leave unset to hide that CTA entirely rather than showing a
++# broken/placeholder link.
++NEXT_PUBLIC_TELEGRAM_CONTACT_USERNAME=
+diff --git a/Frontend/praxis-web/app/courses/[id]/page.tsx b/Frontend/praxis-web/app/courses/[id]/page.tsx
+index 35704174..c9584230 100644
+--- a/Frontend/praxis-web/app/courses/[id]/page.tsx
++++ b/Frontend/praxis-web/app/courses/[id]/page.tsx
+@@ -1,19 +1,56 @@
+ import type { Metadata } from "next";
+ import { notFound } from "next/navigation";
+-import { Clock, Layers } from "lucide-react";
++import { Clock, MonitorPlay, Users2, Video, MessageCircleQuestion } from "lucide-react";
+ import { getCourse } from "@/lib/api/courses";
+ import { listCourseGroups } from "@/lib/api/course-groups";
+ import { ApiError } from "@/lib/api/http";
+ import { Badge } from "@/components/ui/Badge";
+ import { EmptyState } from "@/components/ui/EmptyState";
++import { ErrorState } from "@/components/ui/ErrorState";
+ import { CourseGroupRow } from "@/components/course/CourseGroupRow";
++import { CurriculumAccordion } from "@/components/course/CurriculumAccordion";
+ import { formatMoney } from "@/lib/money";
++import type { CourseDetail, CourseGroup } from "@/lib/types";
+ 
+ interface CourseDetailPageProps {
+   params: Promise<{ id: string }>;
+ }
+ 
+-async function loadCourse(id: string) {
++const TRACK_LABELS: Record<CourseDetail["track"], string> = {
++  FUNDAMENTALS: "Fundamentals",
++  PROFESSION: "Profession",
++  COMBINED: "Combined",
++  MINI: "Mini course",
++};
++
++// Public-safe, academy-wide delivery format — deliberately not sourced
++// from per-course data (Course has no such field) and deliberately free of
++// anything protected: no video URLs, meeting links, or the Telegram group
++// itself, per the standing rule that those stay behind payment.
++const DELIVERY_FORMAT = [
++  {
++    icon: MonitorPlay,
++    title: "Pre-recorded lessons",
++    description: "Screen-capture lessons with voiceover you can rewatch anytime.",
++  },
++  {
++    icon: Video,
++    title: "Live sessions",
++    description: "Scheduled live sessions with your instructor and cohort.",
++  },
++  {
++    icon: Clock,
++    title: "Homework & practicals",
++    description: "Hands-on assignments reviewed between sessions.",
++  },
++  {
++    icon: Users2,
++    title: "Direct instructor access",
++    description: "A private Telegram group with your instructor once you're enrolled.",
++  },
++];
++
++async function loadCourse(id: string): Promise<CourseDetail> {
+   try {
+     return await getCourse(id);
+   } catch (err) {
+@@ -24,11 +61,18 @@ async function loadCourse(id: string) {
+   }
+ }
+ 
++function telegramContactHref(courseTitle: string): string | null {
++  const username = process.env.NEXT_PUBLIC_TELEGRAM_CONTACT_USERNAME;
++  if (!username) return null;
++  const message = `Hello! I have a question about the ${courseTitle} course.`;
++  return `https://t.me/${username}?text=${encodeURIComponent(message)}`;
++}
++
+ export async function generateMetadata({ params }: CourseDetailPageProps): Promise<Metadata> {
+   const { id } = await params;
+   try {
+     const course = await getCourse(id);
+-    return { title: course.title, description: course.summary };
++    return { title: course.title, description: course.description.slice(0, 160) };
+   } catch {
+     return { title: "Course" };
+   }
+@@ -37,37 +81,149 @@ export async function generateMetadata({ params }: CourseDetailPageProps): Promi
+ export default async function CourseDetailPage({ params }: CourseDetailPageProps) {
+   const { id } = await params;
+   const course = await loadCourse(id);
+-  const groups = await listCourseGroups({ courseId: course.id }).catch(() => []);
+ 
+-  const upcomingGroups = groups.filter((g) => g.status !== "COMPLETED" && g.status !== "CANCELLED");
++  let groups: CourseGroup[] = [];
++  let cohortsError = false;
++  try {
++    const result = await listCourseGroups({ courseId: course.id, limit: 50 });
++    groups = result.data;
++  } catch {
++    cohortsError = true;
++  }
++
++  const upcomingGroups = groups.filter(
++    (g) => g.status !== "COMPLETED" && g.status !== "CANCELLED",
++  );
++  const contactHref = telegramContactHref(course.title);
+ 
+   return (
+     <div className="mx-auto max-w-4xl px-4 py-10 sm:px-6 lg:px-8">
+-      <Badge tone="brand">{course.track}</Badge>
++      {/* --- Hero ------------------------------------------------------ */}
++      <Badge tone="brand">{TRACK_LABELS[course.track]}</Badge>
+       <h1 className="mt-3 text-3xl font-semibold tracking-tight text-ink-900-solid">
+         {course.title}
+       </h1>
+-      <p className="mt-3 text-lg text-ink-500">{course.summary}</p>
++      <p className="mt-3 line-clamp-3 text-lg text-ink-500">{course.description}</p>
+ 
+       <div className="mt-4 flex flex-wrap items-center gap-4 text-sm text-ink-500">
+         <span className="flex items-center gap-1.5">
+           <Clock className="h-4 w-4" aria-hidden="true" />
+-          {course.durationWeeks} weeks
++          {course.durationDays} days
+         </span>
+-        <span className="flex items-center gap-1.5">
+-          <Layers className="h-4 w-4" aria-hidden="true" />
+-          {formatMoney(course.priceMinor, course.currency)}
++        <span className="font-semibold text-ink-900-solid">
++          {formatMoney(course.monthlyPrice, course.currency)}
++          <span className="font-normal text-ink-500"> / month</span>
+         </span>
+       </div>
+ 
+-      <div className="mt-8 whitespace-pre-line text-ink-700">{course.description}</div>
++      <div className="mt-6 flex flex-wrap gap-3">
++        <a
++          href="#cohorts"
++          className="inline-flex items-center justify-center rounded-lg bg-brand-600 px-5 py-2.5 text-sm font-medium text-white transition-colors hover:bg-brand-700"
++        >
++          Choose a cohort
++        </a>
++        {contactHref && (
++          <a
++            href={contactHref}
++            target="_blank"
++            rel="noopener noreferrer"
++            className="inline-flex items-center gap-1.5 rounded-lg border border-ink-100 px-5 py-2.5 text-sm font-medium text-ink-700 transition-colors hover:bg-ink-50"
++          >
++            <MessageCircleQuestion className="h-4 w-4" aria-hidden="true" />
++            Ask about this course
++          </a>
++        )}
++      </div>
+ 
+-      <div className="mt-10">
+-        <h2 className="mb-4 text-lg font-semibold text-ink-900-solid">Upcoming cohorts</h2>
+-        {upcomingGroups.length === 0 ? (
++      {/* --- About ------------------------------------------------------ */}
++      <section className="mt-12">
++        <h2 className="mb-3 text-xl font-semibold text-ink-900-solid">About this course</h2>
++        <p className="whitespace-pre-line text-ink-700">{course.description}</p>
++      </section>
++
++      {/* --- What you'll learn ------------------------------------------ */}
++      {course.learningOutcomes.length > 0 && (
++        <section className="mt-10">
++          <h2 className="mb-3 text-xl font-semibold text-ink-900-solid">What you&apos;ll learn</h2>
++          <ul className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
++            {course.learningOutcomes.map((outcome) => (
++              <li key={outcome} className="flex items-start gap-2 text-ink-700">
++                <span className="mt-0.5 text-success-500" aria-hidden="true">
++                  ✓
++                </span>
++                {outcome}
++              </li>
++            ))}
++          </ul>
++        </section>
++      )}
++
++      {/* --- Who it's for ------------------------------------------------ */}
++      {course.targetAudience.length > 0 && (
++        <section className="mt-10">
++          <h2 className="mb-3 text-xl font-semibold text-ink-900-solid">Who this is for</h2>
++          <div className="flex flex-wrap gap-2">
++            {course.targetAudience.map((audience) => (
++              <span
++                key={audience}
++                className="rounded-full bg-ink-50 px-3.5 py-1.5 text-sm text-ink-700"
++              >
++                {audience}
++              </span>
++            ))}
++          </div>
++        </section>
++      )}
++
++      {/* --- Curriculum --------------------------------------------------- */}
++      <section className="mt-10">
++        <h2 className="mb-3 text-xl font-semibold text-ink-900-solid">Curriculum</h2>
++        {course.modules.length > 0 ? (
++          <CurriculumAccordion modules={course.modules} />
++        ) : (
++          <EmptyState title="Curriculum coming soon" description="This course's detailed module breakdown isn't published yet." />
++        )}
++      </section>
++
++      {/* --- How you'll learn ---------------------------------------------- */}
++      <section className="mt-10">
++        <h2 className="mb-4 text-xl font-semibold text-ink-900-solid">How you&apos;ll learn</h2>
++        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
++          {DELIVERY_FORMAT.map(({ icon: Icon, title, description }) => (
++            <div key={title} className="flex gap-3 rounded-[--radius-card] border border-ink-100 p-4">
++              <Icon className="h-5 w-5 shrink-0 text-brand-600" aria-hidden="true" />
++              <div>
++                <p className="font-medium text-ink-900-solid">{title}</p>
++                <p className="text-sm text-ink-500">{description}</p>
++              </div>
++            </div>
++          ))}
++        </div>
++      </section>
++
++      {/* --- Cohorts / enrollment ------------------------------------------ */}
++      <section id="cohorts" className="mt-10 scroll-mt-20">
++        <h2 className="mb-4 text-xl font-semibold text-ink-900-solid">Upcoming cohorts</h2>
++        {cohortsError ? (
++          <ErrorState message="Couldn't load cohorts for this course. Please try again shortly." />
++        ) : upcomingGroups.length === 0 ? (
+           <EmptyState
+-            title="No cohorts scheduled right now"
+-            description="Check back soon, or contact us to be notified when the next one opens."
++            title="No upcoming cohorts are currently available"
++            description="Check back soon, or contact us to learn when the next group starts."
++            action={
++              contactHref && (
++                <a
++                  href={contactHref}
++                  target="_blank"
++                  rel="noopener noreferrer"
++                  className="mt-1 inline-flex items-center gap-1.5 text-sm font-medium text-brand-700 hover:underline"
++                >
++                  <MessageCircleQuestion className="h-4 w-4" aria-hidden="true" />
++                  Ask us on Telegram
++                </a>
++              )
++            }
+           />
+         ) : (
+           <div className="flex flex-col gap-3">
+@@ -76,7 +232,7 @@ export default async function CourseDetailPage({ params }: CourseDetailPageProps
+             ))}
+           </div>
+         )}
+-      </div>
++      </section>
+     </div>
+   );
+ }
+diff --git a/Frontend/praxis-web/app/courses/page.tsx b/Frontend/praxis-web/app/courses/page.tsx
+index ad990a55..273d2f2f 100644
+--- a/Frontend/praxis-web/app/courses/page.tsx
++++ b/Frontend/praxis-web/app/courses/page.tsx
+@@ -4,6 +4,7 @@ import { listCourses } from "@/lib/api/courses";
+ import { CourseCard } from "@/components/course/CourseCard";
+ import { TrackFilter } from "@/components/course/TrackFilter";
+ import { EmptyState } from "@/components/ui/EmptyState";
++import type { Course, CourseTrack } from "@/lib/types";
+ 
+ export const metadata: Metadata = { title: "Courses" };
+ 
+@@ -11,14 +12,20 @@ interface CoursesPageProps {
+   searchParams: Promise<{ track?: string }>;
+ }
+ 
++const VALID_TRACKS: readonly string[] = ["FUNDAMENTALS", "PROFESSION", "COMBINED", "MINI"];
++
+ export default async function CoursesPage({ searchParams }: CoursesPageProps) {
+   const { track } = await searchParams;
++  // Defensive narrowing: an unrecognized/stale `?track=` value must never
++  // reach the API as-is (QueryCoursesDto's whitelist validation would 400
++  // on it) — silently fall back to "no filter" instead.
++  const validTrack = track && VALID_TRACKS.includes(track) ? (track as CourseTrack) : undefined;
+ 
+-  let courses: Awaited<ReturnType<typeof listCourses>>["items"] = [];
++  let courses: Course[] = [];
+   let loadError = false;
+   try {
+-    const result = await listCourses({ track, pageSize: 50 });
+-    courses = result.items;
++    const result = await listCourses({ track: validTrack, limit: 50 });
++    courses = result.data;
+   } catch {
+     loadError = true;
+   }
+diff --git a/Frontend/praxis-web/app/dashboard/DashboardContent.tsx b/Frontend/praxis-web/app/dashboard/DashboardContent.tsx
+index df3cd324..2473db79 100644
+--- a/Frontend/praxis-web/app/dashboard/DashboardContent.tsx
++++ b/Frontend/praxis-web/app/dashboard/DashboardContent.tsx
+@@ -29,21 +29,27 @@ export function DashboardContent() {
+       const [subs, myOrders, courseList, groupList] = await Promise.all([
+         callWithAuth((token) => listMySubscriptions(token)),
+         callWithAuth((token) => listMyOrders(token)),
+-        listCourses({ pageSize: 100 }).catch(() => ({ items: [], total: 0, page: 1, pageSize: 100 })),
+-        listCourseGroups().catch(() => []),
++        listCourses({ limit: 100 }).catch(() => ({
++          data: [],
++          meta: { page: 1, limit: 100, total: 0, totalPages: 0 },
++        })),
++        listCourseGroups({ limit: 100 }).catch(() => ({
++          data: [],
++          meta: { page: 1, limit: 100, total: 0, totalPages: 0 },
++        })),
+       ]);
+ 
+-      // Enrich subscriptions with course/group titles via client-side
++      // Enrich subscriptions with course/group names via client-side
+       // lookups, per the established pattern — the subscription response
+       // itself only carries ids.
+-      const courseTitleById = new Map(courseList.items.map((c) => [c.id, c.title]));
+-      const groupTitleById = new Map(groupList.map((g) => [g.id, g.title]));
++      const courseTitleById = new Map(courseList.data.map((c) => [c.id, c.title]));
++      const groupNameById = new Map(groupList.data.map((g) => [g.id, g.name]));
+ 
+       setSubscriptions(
+         subs.map((s) => ({
+           ...s,
+           courseTitle: courseTitleById.get(s.courseId),
+-          courseGroupTitle: groupTitleById.get(s.courseGroupId),
++          courseGroupName: groupNameById.get(s.courseGroupId),
+         })),
+       );
+       setOrders(myOrders);
+@@ -71,7 +77,7 @@ export function DashboardContent() {
+     <div className="flex flex-col gap-8">
+       <div>
+         <h1 className="text-2xl font-semibold text-ink-900-solid">
+-          Welcome back, {user?.fullName.split(" ")[0]}
++          Welcome back, {user?.name.split(" ")[0]}
+         </h1>
+         <p className="text-sm text-ink-500">Your subscriptions, payments, and Telegram access.</p>
+       </div>
+@@ -114,7 +120,7 @@ export function DashboardContent() {
+                     <tr key={order.id}>
+                       <td className="px-4 py-2.5 text-ink-500">{formatDateTime(order.createdAt)}</td>
+                       <td className="px-4 py-2.5 font-medium text-ink-900-solid">
+-                        {formatMoney(order.amountMinor, order.currency)}
++                        {formatMoney(order.amount, order.currency)}
+                       </td>
+                       <td className="px-4 py-2.5">
+                         <StatusBadge status={order.status} />
+diff --git a/Frontend/praxis-web/app/payment/return/PaymentReturnContent.tsx b/Frontend/praxis-web/app/payment/return/PaymentReturnContent.tsx
+index 3e3ddcc0..a94b5d89 100644
+--- a/Frontend/praxis-web/app/payment/return/PaymentReturnContent.tsx
++++ b/Frontend/praxis-web/app/payment/return/PaymentReturnContent.tsx
+@@ -39,22 +39,34 @@ export function PaymentReturnContent() {
+ 
+     async function poll() {
+       try {
+-        const result = await callWithAuth((token) => getPaymentStatus(orderId!, token));
++        const { order, latestPayment } = await callWithAuth((token) =>
++          getPaymentStatus(orderId!, token),
++        );
+         if (cancelled) return;
+ 
+-        if (result.orderStatus === "PAID") {
++        if (order.status === "PAID") {
+           sessionStorage.removeItem("praxis:pendingOrderId");
+           setState("paid");
+           return;
+         }
+-        if (result.orderStatus === "FAILED" || result.orderStatus === "CANCELLED") {
++        // OrderStatus has no "FAILED" value — an order stays PENDING
++        // until it either succeeds or the order itself expires/is
++        // cancelled. A failed *attempt* (latestPayment.status ===
++        // "FAILED"/"CANCELLED") on an order that's still PENDING is not
++        // terminal by itself: ARCA's own retry flow can still succeed on
++        // the same order, so that case keeps polling rather than
++        // reporting failure early.
++        if (order.status === "CANCELLED" || order.status === "EXPIRED") {
+           setState("failed");
+           return;
+         }
+ 
+         const elapsed = Date.now() - (startedAtRef.current ?? Date.now());
+         if (elapsed >= POLL_TIMEOUT_MS) {
+-          setState("timeout");
++          // Surface a failed final attempt distinctly from a genuine
++          // timeout when we have that signal, but both land the visitor
++          // on the same "didn't go through" screen either way.
++          setState(latestPayment?.status === "FAILED" ? "failed" : "timeout");
+           return;
+         }
+         timeoutHandle = setTimeout(poll, POLL_INTERVAL_MS);
+diff --git a/Frontend/praxis-web/components/admin/AdminContent.tsx b/Frontend/praxis-web/components/admin/AdminContent.tsx
+index 470b729b..a417d924 100644
+--- a/Frontend/praxis-web/components/admin/AdminContent.tsx
++++ b/Frontend/praxis-web/components/admin/AdminContent.tsx
+@@ -47,20 +47,50 @@ export function AdminContent() {
+           <Spinner className="h-5 w-5 text-brand-500" />
+         </div>
+       ) : (
+-        <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+-          <StatCard label="Total students" value={stats.totalStudents.toLocaleString()} icon={Users} />
+-          <StatCard
+-            label="Active subscriptions"
+-            value={stats.activeSubscriptions.toLocaleString()}
+-            icon={TrendingUp}
+-          />
+-          <StatCard label="Pending orders" value={stats.pendingOrders.toLocaleString()} icon={Clock} />
+-          <StatCard
+-            label="Revenue this month"
+-            value={formatMoney(stats.revenueMinorThisMonth, stats.currency)}
+-            icon={CreditCard}
+-          />
+-        </div>
++        <>
++          <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
++            <StatCard label="Total students" value={stats.totalStudents.toLocaleString()} icon={Users} />
++            <StatCard
++              label="Active subscriptions"
++              value={stats.activeSubscriptions.toLocaleString()}
++              icon={TrendingUp}
++            />
++            <StatCard
++              label="Expired subscriptions"
++              value={stats.expiredSubscriptions.toLocaleString()}
++              icon={Clock}
++            />
++            {/* Revenue is tracked per-currency (AMD/USD are never summed
++                together server-side) — one card per currency actually
++                present this month, rather than a single figure that would
++                either drop a currency or silently combine incompatible
++                units. */}
++            {stats.monthlyRevenue.map((revenue) => (
++              <StatCard
++                key={revenue.currency}
++                label={`Revenue this month (${revenue.currency})`}
++                value={formatMoney(revenue.amount, revenue.currency)}
++                icon={CreditCard}
++              />
++            ))}
++          </div>
++
++          {stats.popularCourses.length > 0 && (
++            <div>
++              <h2 className="mb-3 text-sm font-medium text-ink-700">Most popular courses</h2>
++              <ol className="flex flex-col divide-y divide-ink-100 overflow-hidden rounded-[--radius-card] border border-ink-100 bg-white">
++                {stats.popularCourses.map((course, i) => (
++                  <li key={course.courseId} className="flex items-center justify-between px-4 py-2.5 text-sm">
++                    <span className="text-ink-900-solid">
++                      {i + 1}. {course.title}
++                    </span>
++                    <span className="text-ink-500">{course.enrollmentCount} enrollments</span>
++                  </li>
++                ))}
++              </ol>
++            </div>
++          )}
++        </>
+       )}
+ 
+       <div className="grid grid-cols-1 gap-6 lg:grid-cols-[360px_1fr]">
+diff --git a/Frontend/praxis-web/components/admin/StudentDetail.tsx b/Frontend/praxis-web/components/admin/StudentDetail.tsx
+index c0ec13dd..8944ae75 100644
+--- a/Frontend/praxis-web/components/admin/StudentDetail.tsx
++++ b/Frontend/praxis-web/components/admin/StudentDetail.tsx
+@@ -1,7 +1,7 @@
+ "use client";
+ 
+ import { useCallback, useEffect, useState } from "react";
+-import { ShieldOff, ShieldCheck, Mail, Phone, Send } from "lucide-react";
++import { ShieldOff, ShieldCheck, Mail, Phone } from "lucide-react";
+ import { useAuth } from "@/context/AuthContext";
+ import {
+   getStudent,
+@@ -14,7 +14,7 @@ import {
+ } from "@/lib/api/admin";
+ import { ApiError } from "@/lib/api/http";
+ import type { Payment, SafeUser, Subscription } from "@/lib/types";
+-import { formatDate, formatDateTime, formatMoney } from "@/lib/money";
++import { formatDate, formatDateTime } from "@/lib/money";
+ import { Card, CardBody, CardHeader } from "@/components/ui/Card";
+ import { StatusBadge, Badge } from "@/components/ui/Badge";
+ import { Button } from "@/components/ui/Button";
+@@ -24,6 +24,12 @@ import { EmptyState } from "@/components/ui/EmptyState";
+ 
+ type Tab = "payments" | "subscriptions";
+ 
++// Both admin sub-resource lists are paginated server-side, but a single
++// student's history is small enough at this business's scale that one
++// generously-sized page covers "the detail view," rather than building
++// full pager UI twice more inside this panel.
++const DETAIL_PAGE_LIMIT = 100;
++
+ interface StudentDetailProps {
+   studentId: string;
+   /** Called after suspend/reactivate so the parent list can reflect it. */
+@@ -48,12 +54,14 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+     try {
+       const [studentResult, paymentsResult, subscriptionsResult] = await Promise.all([
+         callWithAuth((token) => getStudent(studentId, token)),
+-        callWithAuth((token) => getStudentPayments(studentId, token)),
+-        callWithAuth((token) => getStudentSubscriptions(studentId, token)),
++        callWithAuth((token) => getStudentPayments(studentId, { limit: DETAIL_PAGE_LIMIT }, token)),
++        callWithAuth((token) =>
++          getStudentSubscriptions(studentId, { limit: DETAIL_PAGE_LIMIT }, token),
++        ),
+       ]);
+       setStudent(studentResult);
+-      setPayments(paymentsResult);
+-      setSubscriptions(subscriptionsResult);
++      setPayments(paymentsResult.data);
++      setSubscriptions(subscriptionsResult.data);
+     } catch (err) {
+       setError(err instanceof ApiError ? err.message : "Couldn't load this student.");
+     } finally {
+@@ -76,7 +84,7 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+     setMutationError(null);
+     setIsMutating(true);
+     try {
+-      const updated = student.isSuspended
++      const updated = student.status === "SUSPENDED"
+         ? await callWithAuth((token) => reactivateStudent(student.id, token))
+         : await callWithAuth((token) => suspendStudent(student.id, token));
+       setStudent(updated);
+@@ -109,19 +117,16 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+   if (error) return <ErrorState message={error} onRetry={load} />;
+   if (!student) return null;
+ 
++  const isSuspended = student.status === "SUSPENDED";
++
+   return (
+     <div className="flex flex-col gap-4">
+       <Card>
+         <CardHeader className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+           <div>
+             <div className="flex items-center gap-2">
+-              <h2 className="text-lg font-semibold text-ink-900-solid">{student.fullName}</h2>
+-              {student.isSuspended && <Badge tone="danger">Suspended</Badge>}
+-              {student.telegramLinked && (
+-                <span title="Telegram linked">
+-                  <Send className="h-4 w-4 text-signal-500" aria-hidden="true" />
+-                </span>
+-              )}
++              <h2 className="text-lg font-semibold text-ink-900-solid">{student.name}</h2>
++              {isSuspended && <Badge tone="danger">Suspended</Badge>}
+             </div>
+             <div className="mt-1 flex flex-col gap-1 text-sm text-ink-500 sm:flex-row sm:gap-4">
+               <span className="flex items-center gap-1.5">
+@@ -140,12 +145,12 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+ 
+           {!confirmingSuspend ? (
+             <Button
+-              variant={student.isSuspended ? "secondary" : "danger"}
++              variant={isSuspended ? "secondary" : "danger"}
+               size="sm"
+-              onClick={() => (student.isSuspended ? handleSuspendToggle() : setConfirmingSuspend(true))}
++              onClick={() => (isSuspended ? handleSuspendToggle() : setConfirmingSuspend(true))}
+               isLoading={isMutating && !confirmingSuspend}
+             >
+-              {student.isSuspended ? (
++              {isSuspended ? (
+                 <>
+                   <ShieldCheck className="h-4 w-4" aria-hidden="true" />
+                   Reactivate
+@@ -196,10 +201,10 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+                 <CardBody className="flex flex-wrap items-center justify-between gap-3">
+                   <div>
+                     <p className="font-medium text-ink-900-solid">
+-                      {sub.courseTitle ?? sub.courseId} — {sub.courseGroupTitle ?? sub.courseGroupId}
++                      {sub.courseTitle ?? sub.courseId} — {sub.courseGroupName ?? sub.courseGroupId}
+                     </p>
+                     <p className="text-sm text-ink-500">
+-                      {sub.expiresAt ? `Expires ${formatDate(sub.expiresAt)}` : "No expiry set"}
++                      {sub.expireDate ? `Expires ${formatDate(sub.expireDate)}` : "No expiry set"}
+                     </p>
+                   </div>
+                   <div className="flex items-center gap-3">
+@@ -228,19 +233,21 @@ export function StudentDetail({ studentId, onStudentChanged }: StudentDetailProp
+             <thead className="bg-ink-50 text-left text-ink-500">
+               <tr>
+                 <th className="px-4 py-2.5 font-medium">Date</th>
+-                <th className="px-4 py-2.5 font-medium">Amount</th>
+                 <th className="px-4 py-2.5 font-medium">Provider</th>
++                <th className="px-4 py-2.5 font-medium">Card</th>
+                 <th className="px-4 py-2.5 font-medium">Status</th>
+               </tr>
+             </thead>
+             <tbody className="divide-y divide-ink-100">
+               {payments.map((payment) => (
+                 <tr key={payment.id}>
+-                  <td className="px-4 py-2.5 text-ink-500">{formatDateTime(payment.createdAt)}</td>
+-                  <td className="px-4 py-2.5 font-medium text-ink-900-solid">
+-                    {formatMoney(payment.amountMinor, payment.currency)}
+-                  </td>
++                  <td className="px-4 py-2.5 text-ink-500">{formatDateTime(payment.initiatedAt)}</td>
+                   <td className="px-4 py-2.5 text-ink-500">{payment.provider}</td>
++                  <td className="px-4 py-2.5 text-ink-500">
++                    {payment.cardBrand && payment.cardMask
++                      ? `${payment.cardBrand} ${payment.cardMask}`
++                      : "—"}
++                  </td>
+                   <td className="px-4 py-2.5">
+                     <StatusBadge status={payment.status} />
+                   </td>
+diff --git a/Frontend/praxis-web/components/admin/StudentSearch.tsx b/Frontend/praxis-web/components/admin/StudentSearch.tsx
+index 3615fc9d..33a85194 100644
+--- a/Frontend/praxis-web/components/admin/StudentSearch.tsx
++++ b/Frontend/praxis-web/components/admin/StudentSearch.tsx
+@@ -52,11 +52,13 @@ export function StudentSearch({ selectedId, onSelect, refreshKey }: StudentSearc
+     setIsLoading(true);
+     setError(null);
+ 
+-    callWithAuth((token) => searchStudents({ query: query || undefined, page, pageSize: PAGE_SIZE }, token))
++    callWithAuth((token) =>
++      searchStudents({ search: query || undefined, page, limit: PAGE_SIZE }, token),
++    )
+       .then((result) => {
+         if (cancelled) return;
+-        setResults(result.items);
+-        setTotal(result.total);
++        setResults(result.data);
++        setTotal(result.meta.total);
+       })
+       .catch((err) => {
+         if (cancelled) return;
+@@ -116,10 +118,10 @@ export function StudentSearch({ selectedId, onSelect, refreshKey }: StudentSearc
+                   }`}
+                 >
+                   <div className="min-w-0">
+-                    <p className="truncate font-medium text-ink-900-solid">{student.fullName}</p>
++                    <p className="truncate font-medium text-ink-900-solid">{student.name}</p>
+                     <p className="truncate text-sm text-ink-500">{student.email}</p>
+                   </div>
+-                  {student.isSuspended && <Badge tone="danger">Suspended</Badge>}
++                  {student.status === "SUSPENDED" && <Badge tone="danger">Suspended</Badge>}
+                 </button>
+               </li>
+             ))}
+diff --git a/Frontend/praxis-web/components/course/CourseCard.tsx b/Frontend/praxis-web/components/course/CourseCard.tsx
+index 75e3529b..d3a3929f 100644
+--- a/Frontend/praxis-web/components/course/CourseCard.tsx
++++ b/Frontend/praxis-web/components/course/CourseCard.tsx
+@@ -5,27 +5,34 @@ import { Badge } from "@/components/ui/Badge";
+ import { formatMoney } from "@/lib/money";
+ import type { Course } from "@/lib/types";
+ 
++const TRACK_LABELS: Record<Course["track"], string> = {
++  FUNDAMENTALS: "Fundamentals",
++  PROFESSION: "Profession",
++  COMBINED: "Combined",
++  MINI: "Mini course",
++};
++
+ export function CourseCard({ course }: { course: Course }) {
+   return (
+     <Link href={`/courses/${course.id}`} className="group block">
+       <Card className="h-full transition-shadow group-hover:shadow-md">
+         <CardBody className="flex h-full flex-col gap-3">
+           <div className="flex items-start justify-between gap-2">
+-            <Badge tone="brand">{course.track}</Badge>
++            <Badge tone="brand">{TRACK_LABELS[course.track]}</Badge>
+             <ArrowUpRight
+               className="h-4 w-4 text-ink-300 transition-colors group-hover:text-brand-500"
+               aria-hidden="true"
+             />
+           </div>
+           <h3 className="text-lg font-semibold text-ink-900-solid">{course.title}</h3>
+-          <p className="line-clamp-2 flex-1 text-sm text-ink-500">{course.summary}</p>
++          <p className="line-clamp-2 flex-1 text-sm text-ink-500">{course.description}</p>
+           <div className="flex items-center justify-between border-t border-ink-100 pt-3">
+             <span className="flex items-center gap-1.5 text-sm text-ink-500">
+               <Clock className="h-4 w-4" aria-hidden="true" />
+-              {course.durationWeeks} weeks
++              {course.durationDays} days
+             </span>
+             <span className="font-semibold text-ink-900-solid">
+-              {formatMoney(course.priceMinor, course.currency)}
++              {formatMoney(course.monthlyPrice, course.currency)}
+             </span>
+           </div>
+         </CardBody>
+diff --git a/Frontend/praxis-web/components/course/CourseGroupRow.tsx b/Frontend/praxis-web/components/course/CourseGroupRow.tsx
+index 691a33fc..04c63f4c 100644
+--- a/Frontend/praxis-web/components/course/CourseGroupRow.tsx
++++ b/Frontend/praxis-web/components/course/CourseGroupRow.tsx
+@@ -5,26 +5,33 @@ import { formatDate } from "@/lib/money";
+ import type { CourseGroup } from "@/lib/types";
+ 
+ export function CourseGroupRow({ group }: { group: CourseGroup }) {
+-  const seatsLeft = group.capacity - group.enrolledCount;
+-  const isFull = seatsLeft <= 0;
+-  const isPurchasable = group.status === "SCHEDULED" && !isFull;
++  // Only an UPCOMING group is open for enrollment — ACTIVE means the
++  // cohort has already started, COMPLETED/CANCELLED are terminal. There is
++  // no remaining-seats figure in the API today (CourseGroupResponse has no
++  // enrollment count), so `capacity` is shown as-is rather than inventing
++  // a "seats left" number the backend can't back up.
++  const isPurchasable = group.status === "UPCOMING";
+ 
+   return (
+     <div className="flex flex-col gap-3 rounded-[--radius-card] border border-ink-100 bg-white p-4 sm:flex-row sm:items-center sm:justify-between">
+       <div className="flex flex-col gap-1.5">
+         <div className="flex items-center gap-2">
+-          <span className="font-medium text-ink-900-solid">{group.title}</span>
++          <span className="font-medium text-ink-900-solid">{group.name}</span>
+           <StatusBadge status={group.status} />
+         </div>
+         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-ink-500">
+           <span className="flex items-center gap-1.5">
+             <Calendar className="h-4 w-4" aria-hidden="true" />
+-            {formatDate(group.startDate)} – {formatDate(group.endDate)}
+-          </span>
+-          <span className="flex items-center gap-1.5">
+-            <Users className="h-4 w-4" aria-hidden="true" />
+-            {isFull ? "Full" : `${seatsLeft} of ${group.capacity} seats left`}
++            {formatDate(group.startDate)}
++            {group.endDate ? ` – ${formatDate(group.endDate)}` : ""}
+           </span>
++          <span className="text-ink-400">{group.schedule}</span>
++          {group.capacity != null && (
++            <span className="flex items-center gap-1.5">
++              <Users className="h-4 w-4" aria-hidden="true" />
++              Capacity: {group.capacity}
++            </span>
++          )}
+         </div>
+       </div>
+       <PurchaseButton courseGroupId={group.id} disabled={!isPurchasable} />
+diff --git a/Frontend/praxis-web/components/course/CurriculumAccordion.tsx b/Frontend/praxis-web/components/course/CurriculumAccordion.tsx
+new file mode 100644
+index 00000000..b288ae09
+--- /dev/null
++++ b/Frontend/praxis-web/components/course/CurriculumAccordion.tsx
+@@ -0,0 +1,59 @@
++"use client";
++
++import { useState } from "react";
++import { ChevronDown } from "lucide-react";
++import type { CourseModule } from "@/lib/types";
++
++export function CurriculumAccordion({ modules }: { modules: CourseModule[] }) {
++  // First module open by default so the section doesn't read as empty on
++  // first paint; the rest collapsed to keep a multi-module curriculum
++  // scannable rather than one long wall of text.
++  const [openId, setOpenId] = useState<string | null>(modules[0]?.id ?? null);
++
++  return (
++    <div className="flex flex-col divide-y divide-ink-100 overflow-hidden rounded-[--radius-card] border border-ink-100 bg-white">
++      {modules.map((module, index) => {
++        const isOpen = openId === module.id;
++        return (
++          <div key={module.id}>
++            <button
++              type="button"
++              onClick={() => setOpenId(isOpen ? null : module.id)}
++              aria-expanded={isOpen}
++              aria-controls={`module-panel-${module.id}`}
++              className="flex w-full items-center justify-between gap-4 px-5 py-4 text-left hover:bg-ink-50"
++            >
++              <span className="flex items-baseline gap-3">
++                <span className="text-sm font-medium text-brand-600">
++                  Module {index + 1}
++                </span>
++                <span className="font-medium text-ink-900-solid">{module.title}</span>
++              </span>
++              <ChevronDown
++                className={`h-4 w-4 shrink-0 text-ink-300 transition-transform ${isOpen ? "rotate-180" : ""}`}
++                aria-hidden="true"
++              />
++            </button>
++            {isOpen && (
++              <div id={`module-panel-${module.id}`} className="px-5 pb-5">
++                {module.description && (
++                  <p className="mb-3 text-sm text-ink-500">{module.description}</p>
++                )}
++                {module.topics.length > 0 && (
++                  <ul className="flex flex-col gap-1.5">
++                    {module.topics.map((topic) => (
++                      <li key={topic.id} className="flex items-start gap-2 text-sm text-ink-700">
++                        <span className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-ink-300" aria-hidden="true" />
++                        {topic.label}
++                      </li>
++                    ))}
++                  </ul>
++                )}
++              </div>
++            )}
++          </div>
++        );
++      })}
++    </div>
++  );
++}
+diff --git a/Frontend/praxis-web/components/course/TrackFilter.tsx b/Frontend/praxis-web/components/course/TrackFilter.tsx
+index c2322058..4870f1db 100644
+--- a/Frontend/praxis-web/components/course/TrackFilter.tsx
++++ b/Frontend/praxis-web/components/course/TrackFilter.tsx
+@@ -1,16 +1,27 @@
+ "use client";
+ 
+ import { useRouter, useSearchParams } from "next/navigation";
++import type { CourseTrack } from "@/lib/types";
+ 
+-const TRACKS = ["All", "QA Automation", "Backend", "Frontend", "DevOps"];
++// Values must be the real CourseTrack enum members — the backend's
++// QueryCoursesDto rejects anything else with a 400 (whitelist validation).
++// Human-readable labels are for display only, never sent as the query
++// value. See courses.controller.ts / query-courses.dto.ts.
++const TRACKS: { value: CourseTrack | "ALL"; label: string }[] = [
++  { value: "ALL", label: "All" },
++  { value: "FUNDAMENTALS", label: "Fundamentals" },
++  { value: "PROFESSION", label: "Profession" },
++  { value: "COMBINED", label: "Combined" },
++  { value: "MINI", label: "Mini courses" },
++];
+ 
+ export function TrackFilter({ current }: { current?: string }) {
+   const router = useRouter();
+   const searchParams = useSearchParams();
+ 
+-  function selectTrack(track: string) {
++  function selectTrack(track: CourseTrack | "ALL") {
+     const params = new URLSearchParams(searchParams.toString());
+-    if (track === "All") {
++    if (track === "ALL") {
+       params.delete("track");
+     } else {
+       params.set("track", track);
+@@ -20,13 +31,13 @@ export function TrackFilter({ current }: { current?: string }) {
+ 
+   return (
+     <div className="flex flex-wrap gap-2" role="group" aria-label="Filter courses by track">
+-      {TRACKS.map((track) => {
+-        const isActive = track === "All" ? !current : current === track;
++      {TRACKS.map(({ value, label }) => {
++        const isActive = value === "ALL" ? !current : current === value;
+         return (
+           <button
+-            key={track}
++            key={value}
+             type="button"
+-            onClick={() => selectTrack(track)}
++            onClick={() => selectTrack(value)}
+             aria-pressed={isActive}
+             className={`rounded-full px-4 py-1.5 text-sm font-medium transition-colors ${
+               isActive
+@@ -34,7 +45,7 @@ export function TrackFilter({ current }: { current?: string }) {
+                 : "bg-white text-ink-700 border border-ink-100 hover:bg-ink-50"
+             }`}
+           >
+-            {track}
++            {label}
+           </button>
+         );
+       })}
+diff --git a/Frontend/praxis-web/components/layout/Navbar.tsx b/Frontend/praxis-web/components/layout/Navbar.tsx
+index d1864bf5..3082ca35 100644
+--- a/Frontend/praxis-web/components/layout/Navbar.tsx
++++ b/Frontend/praxis-web/components/layout/Navbar.tsx
+@@ -59,7 +59,7 @@ export function Navbar() {
+           {isInitializing ? null : user ? (
+             <>
+               <Link href="/dashboard" className="text-sm font-medium text-ink-700 hover:text-ink-900-solid">
+-                {user.fullName.split(" ")[0]}
++                {user.name.split(" ")[0]}
+               </Link>
+               <Button size="sm" variant="ghost" onClick={handleLogout}>
+                 Log out
+diff --git a/Frontend/praxis-web/components/payment/PurchaseButton.tsx b/Frontend/praxis-web/components/payment/PurchaseButton.tsx
+index 354e11de..f95e1b8d 100644
+--- a/Frontend/praxis-web/components/payment/PurchaseButton.tsx
++++ b/Frontend/praxis-web/components/payment/PurchaseButton.tsx
+@@ -19,10 +19,17 @@ export function PurchaseButton({ courseGroupId, disabled }: PurchaseButtonProps)
+   const router = useRouter();
+   const [isLoading, setIsLoading] = useState(false);
+   const [error, setError] = useState<string | null>(null);
++  // Only shown once an unauthenticated visitor actually tries to enroll —
++  // avoids two loud CTAs competing for attention on every single row.
++  const [showAuthChoice, setShowAuthChoice] = useState(false);
++
++  function goToAuth(path: "/login" | "/register") {
++    router.push(`${path}?returnTo=${encodeURIComponent(window.location.pathname)}`);
++  }
+ 
+   async function handlePurchase() {
+     if (!user) {
+-      router.push(`/register?returnTo=${encodeURIComponent(window.location.pathname)}`);
++      setShowAuthChoice(true);
+       return;
+     }
+ 
+@@ -30,11 +37,11 @@ export function PurchaseButton({ courseGroupId, disabled }: PurchaseButtonProps)
+     setIsLoading(true);
+     try {
+       const order = await callWithAuth((token) => createOrder({ courseGroupId }, token));
+-      const { redirectUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
++      const { paymentUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
+       // The order id is carried via sessionStorage because the backend's
+       // ARCA_RETURN_URL is a single fixed URL, not per-order.
+       sessionStorage.setItem("praxis:pendingOrderId", order.id);
+-      window.location.href = redirectUrl;
++      window.location.href = paymentUrl;
+     } catch (err) {
+       setError(
+         err instanceof ApiError
+@@ -45,6 +52,22 @@ export function PurchaseButton({ courseGroupId, disabled }: PurchaseButtonProps)
+     }
+   }
+ 
++  if (showAuthChoice) {
++    return (
++      <div className="flex flex-col items-end gap-2">
++        <p className="text-sm text-ink-500">Log in or create an account to enroll.</p>
++        <div className="flex gap-2">
++          <Button size="sm" variant="secondary" onClick={() => goToAuth("/login")}>
++            Log in
++          </Button>
++          <Button size="sm" onClick={() => goToAuth("/register")}>
++            Create account
++          </Button>
++        </div>
++      </div>
++    );
++  }
++
+   return (
+     <div className="flex flex-col items-end gap-1.5">
+       <Button onClick={handlePurchase} disabled={disabled} isLoading={isLoading}>
+diff --git a/Frontend/praxis-web/components/subscription/SubscriptionCard.tsx b/Frontend/praxis-web/components/subscription/SubscriptionCard.tsx
+index fbe59582..1793494e 100644
+--- a/Frontend/praxis-web/components/subscription/SubscriptionCard.tsx
++++ b/Frontend/praxis-web/components/subscription/SubscriptionCard.tsx
+@@ -6,6 +6,7 @@ import { StatusBadge } from "@/components/ui/Badge";
+ import { Button } from "@/components/ui/Button";
+ import { useAuth } from "@/context/AuthContext";
+ import { renewSubscription, cancelSubscription } from "@/lib/api/subscriptions";
++import { initiatePayment } from "@/lib/api/payments";
+ import { ApiError } from "@/lib/api/http";
+ import { formatDate } from "@/lib/money";
+ import type { Subscription } from "@/lib/types";
+@@ -20,15 +21,31 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+   const [pendingAction, setPendingAction] = useState<"renew" | "cancel" | null>(null);
+   const [error, setError] = useState<string | null>(null);
+ 
+-  async function handleAction(action: "renew" | "cancel") {
++  // Renewing does NOT extend the subscription in place — it creates a new
++  // payable Order (see subscriptions.ts's doc comment on renewSubscription)
++  // that still has to go through ARCA like any first-time purchase. So
++  // this follows the exact same createOrder-adjacent
++  // initiatePayment→redirect sequence PurchaseButton uses, rather than
++  // treating the response as an updated Subscription.
++  async function handleRenew() {
+     setError(null);
+-    setPendingAction(action);
++    setPendingAction("renew");
+     try {
+-      const updated = await callWithAuth((token) =>
+-        action === "renew"
+-          ? renewSubscription(subscription.id, token)
+-          : cancelSubscription(subscription.id, token),
+-      );
++      const order = await callWithAuth((token) => renewSubscription(subscription.id, token));
++      const { paymentUrl } = await callWithAuth((token) => initiatePayment(order.id, token));
++      sessionStorage.setItem("praxis:pendingOrderId", order.id);
++      window.location.href = paymentUrl;
++    } catch (err) {
++      setError(err instanceof ApiError ? err.message : "That didn't go through. Try again.");
++      setPendingAction(null);
++    }
++  }
++
++  async function handleCancel() {
++    setError(null);
++    setPendingAction("cancel");
++    try {
++      const updated = await callWithAuth((token) => cancelSubscription(subscription.id, token));
+       onChange(updated);
+     } catch (err) {
+       setError(err instanceof ApiError ? err.message : "That didn't go through. Try again.");
+@@ -37,8 +54,11 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+     }
+   }
+ 
+-  const canRenew = subscription.status === "EXPIRED" || subscription.status === "CANCELLED";
+-  const canCancel = subscription.status === "ACTIVE" || subscription.status === "PENDING";
++  const canRenew = subscription.status === "EXPIRED" || subscription.status === "ACTIVE";
++  // SubscriptionsService.cancel() rejects anything that isn't ACTIVE with
++  // a 409 — PENDING (never paid) and EXPIRED/CANCELLED aren't cancellable
++  // states.
++  const canCancel = subscription.status === "ACTIVE";
+ 
+   return (
+     <Card>
+@@ -48,14 +68,14 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+             <p className="font-medium text-ink-900-solid">
+               {subscription.courseTitle ?? "Course"}
+             </p>
+-            <p className="text-sm text-ink-500">{subscription.courseGroupTitle}</p>
++            <p className="text-sm text-ink-500">{subscription.courseGroupName}</p>
+           </div>
+           <StatusBadge status={subscription.status} />
+         </div>
+-        {subscription.expiresAt && (
++        {subscription.expireDate && (
+           <p className="text-sm text-ink-500">
+             {subscription.status === "ACTIVE" ? "Renews" : "Expired"} on{" "}
+-            {formatDate(subscription.expiresAt)}
++            {formatDate(subscription.expireDate)}
+           </p>
+         )}
+         {error && (
+@@ -71,7 +91,7 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+                 variant="secondary"
+                 isLoading={pendingAction === "renew"}
+                 disabled={pendingAction !== null}
+-                onClick={() => handleAction("renew")}
++                onClick={handleRenew}
+               >
+                 Renew
+               </Button>
+@@ -82,7 +102,7 @@ export function SubscriptionCard({ subscription, onChange }: SubscriptionCardPro
+                 variant="ghost"
+                 isLoading={pendingAction === "cancel"}
+                 disabled={pendingAction !== null}
+-                onClick={() => handleAction("cancel")}
++                onClick={handleCancel}
+               >
+                 Cancel
+               </Button>
+diff --git a/Frontend/praxis-web/components/telegram/TelegramLinkCard.tsx b/Frontend/praxis-web/components/telegram/TelegramLinkCard.tsx
+index f81538f5..a3e90f08 100644
+--- a/Frontend/praxis-web/components/telegram/TelegramLinkCard.tsx
++++ b/Frontend/praxis-web/components/telegram/TelegramLinkCard.tsx
+@@ -1,30 +1,56 @@
+ "use client";
+ 
+-import { useState } from "react";
++import { useCallback, useEffect, useState } from "react";
+ import { Send, CheckCircle2 } from "lucide-react";
+ import { Card, CardBody } from "@/components/ui/Card";
+ import { Button } from "@/components/ui/Button";
++import { Spinner } from "@/components/ui/Spinner";
+ import { useAuth } from "@/context/AuthContext";
+-import { requestTelegramLink } from "@/lib/api/telegram";
++import { requestTelegramLink, getTelegramLinkStatus } from "@/lib/api/telegram";
+ import { ApiError } from "@/lib/api/http";
+ 
+ export function TelegramLinkCard() {
+   const { user, callWithAuth } = useAuth();
+-  const [isLoading, setIsLoading] = useState(false);
++  const [isLinked, setIsLinked] = useState<boolean | null>(null);
++  const [isConnecting, setIsConnecting] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+ 
++  // There is no `telegramLinked` field on SafeUser — actual link status
++  // (as opposed to the self-reported, unverified telegramUsername) lives
++  // only behind GET /telegram/link/status.
++  const loadStatus = useCallback(async () => {
++    try {
++      const { linked } = await callWithAuth((token) => getTelegramLinkStatus(token));
++      setIsLinked(linked);
++    } catch {
++      setIsLinked(false);
++    }
++  }, [callWithAuth]);
++
++  useEffect(() => {
++    if (!user) return;
++    // Sanctioned "fetch from an external system on mount" pattern.
++    // eslint-disable-next-line react-hooks/set-state-in-effect
++    loadStatus();
++  }, [user, loadStatus]);
++
+   async function handleConnect() {
+     setError(null);
+-    setIsLoading(true);
++    setIsConnecting(true);
+     try {
+       const { deepLink } = await callWithAuth((token) => requestTelegramLink(token));
+       window.open(deepLink, "_blank", "noopener,noreferrer");
++      // The bot completes the link asynchronously once the student opens
++      // the deep link in Telegram and sends /start — there's no
++      // synchronous confirmation, so poll once after a delay rather than
++      // assuming success.
++      setTimeout(loadStatus, 4000);
+     } catch (err) {
+       setError(
+         err instanceof ApiError ? err.message : "Couldn't get a Telegram link. Try again.",
+       );
+     } finally {
+-      setIsLoading(false);
++      setIsConnecting(false);
+     }
+   }
+ 
+@@ -40,16 +66,20 @@ export function TelegramLinkCard() {
+           <div>
+             <p className="font-medium text-ink-900-solid">Telegram cohort access</p>
+             <p className="text-sm text-ink-500">
+-              {user.telegramLinked
+-                ? "Your account is linked."
+-                : "Connect Telegram to join your cohort's group."}
++              {isLinked === null
++                ? "Checking your Telegram connection…"
++                : isLinked
++                  ? "Your account is linked."
++                  : "Connect Telegram to join your cohort's group."}
+             </p>
+           </div>
+         </div>
+-        {user.telegramLinked ? (
++        {isLinked === null ? (
++          <Spinner className="h-5 w-5 text-ink-300" />
++        ) : isLinked ? (
+           <CheckCircle2 className="h-6 w-6 text-success-500" aria-hidden="true" />
+         ) : (
+-          <Button size="sm" onClick={handleConnect} isLoading={isLoading}>
++          <Button size="sm" onClick={handleConnect} isLoading={isConnecting}>
+             Connect Telegram
+           </Button>
+         )}
+diff --git a/Frontend/praxis-web/components/ui/Badge.tsx b/Frontend/praxis-web/components/ui/Badge.tsx
+index d3714b98..8538a5a2 100644
+--- a/Frontend/praxis-web/components/ui/Badge.tsx
++++ b/Frontend/praxis-web/components/ui/Badge.tsx
+@@ -24,14 +24,17 @@ const STATUS_TONE: Record<string, Tone> = {
+   PAID: "success",
+   SUCCEEDED: "success",
+   PENDING: "warning",
+-  IN_PROGRESS: "warning",
+-  SCHEDULED: "brand",
++  INITIATED: "warning",
++  UPCOMING: "brand",
+   DRAFT: "neutral",
++  SUSPENDED: "danger",
+   EXPIRED: "danger",
+   FAILED: "danger",
+   CANCELLED: "danger",
++  REFUNDED: "neutral",
+   ARCHIVED: "neutral",
+   COMPLETED: "neutral",
++  DELETED: "danger",
+ };
+ 
+ export function StatusBadge({ status }: { status: string }) {
+diff --git a/Frontend/praxis-web/lib/api/admin.ts b/Frontend/praxis-web/lib/api/admin.ts
+index d620a614..7c72ea71 100644
+--- a/Frontend/praxis-web/lib/api/admin.ts
++++ b/Frontend/praxis-web/lib/api/admin.ts
+@@ -1,14 +1,18 @@
+ import { request, toQueryString } from "@/lib/api/http";
+ import type { DashboardStats, Payment, SafeUser, Subscription, PaginatedResult } from "@/lib/types";
++import type { UserStatus } from "@/lib/types";
+ 
++// Real route: GET /admin/dashboard — NOT /admin/stats. See
++// admin-dashboard.controller.ts.
+ export function getDashboardStats(accessToken: string) {
+-  return request<DashboardStats>("/admin/stats", { accessToken });
++  return request<DashboardStats>("/admin/dashboard", { accessToken });
+ }
+ 
+ export interface SearchStudentsParams {
+-  query?: string;
++  search?: string;
++  status?: UserStatus;
+   page?: number;
+-  pageSize?: number;
++  limit?: number;
+ }
+ 
+ export function searchStudents(params: SearchStudentsParams, accessToken: string) {
+@@ -21,29 +25,44 @@ export function getStudent(id: string, accessToken: string) {
+   return request<SafeUser>(`/admin/students/${id}`, { accessToken });
+ }
+ 
+-export function getStudentPayments(id: string, accessToken: string) {
+-  return request<Payment[]>(`/admin/students/${id}/payments`, { accessToken });
++// Both admin student sub-resources are paginated (PaginatedResult<...>),
++// not flat arrays — see admin-students.controller.ts's findPayments /
++// findSubscriptions.
++export function getStudentPayments(
++  id: string,
++  params: { page?: number; limit?: number } = {},
++  accessToken?: string,
++) {
++  return request<PaginatedResult<Payment>>(`/admin/students/${id}/payments${toQueryString(params)}`, {
++    accessToken,
++  });
+ }
+ 
+-export function getStudentSubscriptions(id: string, accessToken: string) {
+-  return request<Subscription[]>(`/admin/students/${id}/subscriptions`, { accessToken });
++export function getStudentSubscriptions(
++  id: string,
++  params: { page?: number; limit?: number } = {},
++  accessToken?: string,
++) {
++  return request<PaginatedResult<Subscription>>(
++    `/admin/students/${id}/subscriptions${toQueryString(params)}`,
++    { accessToken },
++  );
+ }
+ 
+-export function suspendStudent(id: string, accessToken: string, reason?: string) {
+-  return request<SafeUser>(`/admin/students/${id}/suspend`, {
+-    method: "POST",
+-    body: reason ? { reason } : undefined,
+-    accessToken,
+-  });
++export function suspendStudent(id: string, accessToken: string) {
++  return request<SafeUser>(`/admin/students/${id}/suspend`, { method: "POST", accessToken });
+ }
+ 
+ export function reactivateStudent(id: string, accessToken: string) {
+   return request<SafeUser>(`/admin/students/${id}/reactivate`, { method: "POST", accessToken });
+ }
+ 
+-export function activateSubscription(id: string, accessToken: string) {
++// ActivateSubscriptionDto.expireDate is optional — omitted here defaults to
++// one month from now on the backend.
++export function activateSubscription(id: string, accessToken: string, expireDate?: string) {
+   return request<Subscription>(`/admin/subscriptions/${id}/activate`, {
+     method: "POST",
++    body: expireDate ? { expireDate } : undefined,
+     accessToken,
+   });
+ }
+diff --git a/Frontend/praxis-web/lib/api/course-groups.ts b/Frontend/praxis-web/lib/api/course-groups.ts
+index 3e33797c..38d7cf88 100644
+--- a/Frontend/praxis-web/lib/api/course-groups.ts
++++ b/Frontend/praxis-web/lib/api/course-groups.ts
+@@ -1,12 +1,16 @@
+ import { request, toQueryString } from "@/lib/api/http";
+-import type { CourseGroup } from "@/lib/types";
++import type { CourseGroup, CourseGroupStatus, PaginatedResult } from "@/lib/types";
+ 
+ export interface ListCourseGroupsParams {
+   courseId?: string;
++  page?: number;
++  limit?: number;
+ }
+ 
++// GET /course-groups is paginated (PaginatedResult<CourseGroupResponse>),
++// not a bare array — see course-groups.controller.ts's findPublished.
+ export function listCourseGroups(params?: ListCourseGroupsParams, next?: NextFetchRequestConfig) {
+-  return request<CourseGroup[]>(`/course-groups${toQueryString(params)}`, {
++  return request<PaginatedResult<CourseGroup>>(`/course-groups${toQueryString(params)}`, {
+     skipCredentials: true,
+     next: next ?? { revalidate: 60 },
+   });
+@@ -16,13 +20,18 @@ export function getCourseGroup(id: string, accessToken?: string) {
+   return request<CourseGroup>(`/course-groups/${id}`, { accessToken, skipCredentials: !accessToken });
+ }
+ 
++// Mirrors CreateCourseGroupDto exactly: `name` (not `title`), a required
++// free-text `schedule`, optional `teacherId`, optional `capacity`. There is
++// no `telegramGroupChatId` on this DTO — linking a Telegram chat to a group
++// is a separate admin action (POST /telegram/admin/link-group).
+ export interface CourseGroupPayload {
+   courseId: string;
+-  title: string;
++  name: string;
+   startDate: string;
+-  endDate: string;
+-  capacity: number;
+-  telegramGroupChatId?: string;
++  endDate?: string;
++  schedule: string;
++  teacherId?: string;
++  capacity?: number;
+ }
+ 
+ export function createCourseGroup(payload: CourseGroupPayload, accessToken: string) {
+@@ -31,7 +40,7 @@ export function createCourseGroup(payload: CourseGroupPayload, accessToken: stri
+ 
+ export function updateCourseGroup(
+   id: string,
+-  payload: Partial<CourseGroupPayload> & { status?: CourseGroup["status"] },
++  payload: Partial<Omit<CourseGroupPayload, "courseId">> & { status?: CourseGroupStatus },
+   accessToken: string,
+ ) {
+   return request<CourseGroup>(`/course-groups/${id}`, { method: "PATCH", body: payload, accessToken });
+diff --git a/Frontend/praxis-web/lib/api/course-modules.ts b/Frontend/praxis-web/lib/api/course-modules.ts
+new file mode 100644
+index 00000000..43cafc81
+--- /dev/null
++++ b/Frontend/praxis-web/lib/api/course-modules.ts
+@@ -0,0 +1,71 @@
++import { request } from "@/lib/api/http";
++import type { CourseModule, CourseTopic } from "@/lib/types";
++
++// Admin-only curriculum management (course-modules.controller.ts /
++// course-topics.controller.ts). Students never call these — the public
++// course-detail read (getCourse in courses.ts) already returns modules and
++// topics, ordered, as part of CourseDetail.
++
++export function createCourseModule(
++  payload: { courseId: string; title: string; description: string },
++  accessToken: string,
++) {
++  return request<CourseModule>("/course-modules", { method: "POST", body: payload, accessToken });
++}
++
++export function updateCourseModule(
++  id: string,
++  payload: Partial<{ title: string; description: string }>,
++  accessToken: string,
++) {
++  return request<CourseModule>(`/course-modules/${id}`, {
++    method: "PATCH",
++    body: payload,
++    accessToken,
++  });
++}
++
++export function deleteCourseModule(id: string, accessToken: string) {
++  return request<void>(`/course-modules/${id}`, { method: "DELETE", accessToken });
++}
++
++// `moduleIds` must be exactly the course's existing module ids, in the
++// desired final order — the backend rejects a partial or mismatched set.
++export function reorderCourseModules(
++  courseId: string,
++  moduleIds: string[],
++  accessToken: string,
++) {
++  return request<CourseModule[]>("/course-modules/reorder", {
++    method: "PATCH",
++    body: { courseId, moduleIds },
++    accessToken,
++  });
++}
++
++export function createCourseTopic(
++  payload: { moduleId: string; label: string },
++  accessToken: string,
++) {
++  return request<CourseTopic>("/course-topics", { method: "POST", body: payload, accessToken });
++}
++
++export function updateCourseTopic(id: string, label: string, accessToken: string) {
++  return request<CourseTopic>(`/course-topics/${id}`, {
++    method: "PATCH",
++    body: { label },
++    accessToken,
++  });
++}
++
++export function deleteCourseTopic(id: string, accessToken: string) {
++  return request<void>(`/course-topics/${id}`, { method: "DELETE", accessToken });
++}
++
++export function reorderCourseTopics(moduleId: string, topicIds: string[], accessToken: string) {
++  return request<CourseTopic[]>("/course-topics/reorder", {
++    method: "PATCH",
++    body: { moduleId, topicIds },
++    accessToken,
++  });
++}
+diff --git a/Frontend/praxis-web/lib/api/courses.ts b/Frontend/praxis-web/lib/api/courses.ts
+index 853a01e2..b3aafa03 100644
+--- a/Frontend/praxis-web/lib/api/courses.ts
++++ b/Frontend/praxis-web/lib/api/courses.ts
+@@ -1,10 +1,11 @@
+ import { request, toQueryString } from "@/lib/api/http";
+-import type { Course, PaginatedResult } from "@/lib/types";
++import type { Course, CourseDetail, CourseStatus, CourseTrack, PaginatedResult } from "@/lib/types";
+ 
+ export interface ListCoursesParams {
+-  track?: string;
++  track?: CourseTrack;
++  search?: string;
+   page?: number;
+-  pageSize?: number;
++  limit?: number;
+ }
+ 
+ export function listCourses(params?: ListCoursesParams, next?: NextFetchRequestConfig) {
+@@ -14,23 +15,28 @@ export function listCourses(params?: ListCoursesParams, next?: NextFetchRequestC
+   });
+ }
+ 
++// Public course-detail reads return the extended CourseDetail shape
++// (targetAudience/learningOutcomes/modules) once the curriculum feature is
++// present — see courses.service.ts's findOnePublished.
+ export function getCourse(id: string, next?: NextFetchRequestConfig) {
+-  return request<Course>(`/courses/${id}`, {
++  return request<CourseDetail>(`/courses/${id}`, {
+     skipCredentials: true,
+     next: next ?? { revalidate: 60 },
+   });
+ }
+ 
++// Mirrors CreateCourseDto exactly. Not yet wired to an admin UI (none
++// exists on the frontend for course management today) but kept correct so
++// it isn't a trap for the next feature that needs it.
+ export interface CoursePayload {
+   title: string;
+-  slug: string;
+-  track: string;
+-  summary: string;
++  slug?: string;
+   description: string;
+-  priceMinor: number;
+-  currency: string;
+-  durationWeeks: number;
+-  status: "DRAFT" | "PUBLISHED" | "ARCHIVED";
++  track: CourseTrack;
++  monthlyPrice: number;
++  currency?: "AMD" | "USD";
++  durationDays: number;
++  status?: CourseStatus;
+ }
+ 
+ export function createCourse(payload: CoursePayload, accessToken: string) {
+@@ -44,3 +50,16 @@ export function updateCourse(id: string, payload: Partial<CoursePayload>, access
+ export function deleteCourse(id: string, accessToken: string) {
+   return request<void>(`/courses/${id}`, { method: "DELETE", accessToken });
+ }
++
++export function listCoursesAdmin(
++  params: ListCoursesParams & { status?: CourseStatus } = {},
++  accessToken?: string,
++) {
++  return request<PaginatedResult<Course>>(`/courses/admin${toQueryString(params)}`, {
++    accessToken,
++  });
++}
++
++export function getCourseAdmin(id: string, accessToken: string) {
++  return request<Course>(`/courses/admin/${id}`, { accessToken });
++}
+diff --git a/Frontend/praxis-web/lib/api/payments.ts b/Frontend/praxis-web/lib/api/payments.ts
+index c6e6d3fa..78f4d3fd 100644
+--- a/Frontend/praxis-web/lib/api/payments.ts
++++ b/Frontend/praxis-web/lib/api/payments.ts
+@@ -1,25 +1,38 @@
+ import { request } from "@/lib/api/http";
+-import type { Payment } from "@/lib/types";
+-
+-export interface InitiatePaymentResult {
+-  redirectUrl: string;
+-  paymentId: string;
+-}
++import type { Order, Payment } from "@/lib/types";
+ 
++// Real route: POST /payments/initiate with { orderId } in the body — NOT
++// POST /payments/:orderId/initiate. Real response is { paymentUrl }, not
++// { redirectUrl, paymentId } — see payments.controller.ts's `initiate`.
+ export function initiatePayment(orderId: string, accessToken: string) {
+-  return request<InitiatePaymentResult>(`/payments/${orderId}/initiate`, {
++  return request<{ paymentUrl: string }>("/payments/initiate", {
+     method: "POST",
++    body: { orderId },
+     accessToken,
+   });
+ }
+ 
+ export interface PaymentStatusResult {
+-  status: Payment["status"];
+-  orderStatus: "PENDING" | "PAID" | "EXPIRED" | "CANCELLED" | "FAILED";
++  order: Order;
++  latestPayment: Payment | null;
+ }
+ 
+ // Polled by /payment/return since the ARCA webhook confirming payment can
+-// arrive slightly before or after the browser redirect completes.
++// arrive slightly before or after the browser redirect completes. Real
++// response shape is { order, latestPayment } — the terminal signal to
++// watch is `order.status`, which never takes the value "FAILED" (that
++// only exists as a Payment.status; see PaymentReturnContent for how a
++// failed attempt on an otherwise-still-PENDING order is distinguished).
+ export function getPaymentStatus(orderId: string, accessToken: string) {
+   return request<PaymentStatusResult>(`/payments/${orderId}/status`, { accessToken });
+ }
++
++// `amount` (integer minor units) is required by RefundPaymentDto — a
++// refund always has an explicit amount, never "refund whatever's left."
++export function refundPayment(orderId: string, amount: number, accessToken: string) {
++  return request<Payment>(`/payments/${orderId}/refund`, {
++    method: "POST",
++    body: { amount },
++    accessToken,
++  });
++}
+diff --git a/Frontend/praxis-web/lib/api/subscriptions.ts b/Frontend/praxis-web/lib/api/subscriptions.ts
+index 9130a02d..750854a6 100644
+--- a/Frontend/praxis-web/lib/api/subscriptions.ts
++++ b/Frontend/praxis-web/lib/api/subscriptions.ts
+@@ -1,12 +1,19 @@
+ import { request } from "@/lib/api/http";
+-import type { Subscription } from "@/lib/types";
++import type { Order, Subscription } from "@/lib/types";
+ 
+ export function listMySubscriptions(accessToken: string) {
+   return request<Subscription[]>("/subscriptions/me", { accessToken });
+ }
+ 
++// Real endpoint creates and returns a new payable Order — it does NOT
++// extend or return the Subscription itself. See
++// SubscriptionsController.renew / SubscriptionsService.initiateRenewal:
++// "A renewal creates a new payable Order. It does not instantly extend the
++// subscription." The caller must continue through the same
++// createOrder-less payment flow PurchaseButton uses (initiatePayment then
++// redirect) — see SubscriptionCard's renew handler.
+ export function renewSubscription(id: string, accessToken: string) {
+-  return request<Subscription>(`/subscriptions/${id}/renew`, { method: "POST", accessToken });
++  return request<Order>(`/subscriptions/${id}/renew`, { method: "POST", accessToken });
+ }
+ 
+ export function cancelSubscription(id: string, accessToken: string) {
+diff --git a/Frontend/praxis-web/lib/api/telegram.ts b/Frontend/praxis-web/lib/api/telegram.ts
+index a86d861b..eaa56458 100644
+--- a/Frontend/praxis-web/lib/api/telegram.ts
++++ b/Frontend/praxis-web/lib/api/telegram.ts
+@@ -5,12 +5,15 @@ export interface TelegramLinkResult {
+   expiresAt: string;
+ }
+ 
+-// Requests a one-time /start <token> deep link. The bot links the account
+-// server-side once the student opens the link in Telegram.
++// Real route: POST /telegram/link/request — NOT /telegram/link. See
++// telegram.controller.ts.
+ export function requestTelegramLink(accessToken: string) {
+-  return request<TelegramLinkResult>("/telegram/link", { method: "POST", accessToken });
++  return request<TelegramLinkResult>("/telegram/link/request", { method: "POST", accessToken });
+ }
+ 
+-export function unlinkTelegram(accessToken: string) {
+-  return request<void>("/telegram/unlink", { method: "POST", accessToken });
++// There is no SafeUser.telegramLinked field — actual link status (as
++// opposed to the self-reported telegramUsername) has to be fetched
++// separately from GET /telegram/link/status.
++export function getTelegramLinkStatus(accessToken: string) {
++  return request<{ linked: boolean }>("/telegram/link/status", { accessToken });
+ }
+diff --git a/Frontend/praxis-web/lib/types.ts b/Frontend/praxis-web/lib/types.ts
+index 01ee4545..b7e485aa 100644
+--- a/Frontend/praxis-web/lib/types.ts
++++ b/Frontend/praxis-web/lib/types.ts
+@@ -1,105 +1,187 @@
+-// Mirrors praxis-api response shapes exactly. Money fields are integers in
+-// minor units (e.g. AMD cents) — never floats. Divide by 100 only at the
+-// display edge; never store or compare the divided value.
++// Mirrors the Admin_Panel_Backend response shapes exactly — verified
++// field-by-field against prisma/schema.prisma and each module's
++// controller/service/response-interface source, not assumed. Money fields
++// are integers in minor units (e.g. AMD cents) — never floats. Divide by
++// 100 only at the display edge (lib/money.ts); never store or compare the
++// divided value.
++//
++// Most endpoints in this API return the raw Prisma model shape directly
++// (CoursesController, CourseGroupsController excepted — see below), so
++// these types intentionally match the Prisma schema's field names,
++// including nullability, rather than an idealized "clean" API shape.
+ 
+ export type Role = "STUDENT" | "TEACHER" | "ADMIN";
++export type UserStatus = "ACTIVE" | "SUSPENDED" | "DELETED";
++export type Locale = "EN" | "RU" | "HY";
+ 
++export type CourseTrack = "FUNDAMENTALS" | "PROFESSION" | "COMBINED" | "MINI";
++export type Currency = "AMD" | "USD";
+ export type CourseStatus = "DRAFT" | "PUBLISHED" | "ARCHIVED";
+-
+-export type CourseGroupStatus = "SCHEDULED" | "IN_PROGRESS" | "COMPLETED" | "CANCELLED";
+-
+-export type OrderStatus = "PENDING" | "PAID" | "EXPIRED" | "CANCELLED" | "FAILED";
+-
++export type CourseGroupStatus = "UPCOMING" | "ACTIVE" | "COMPLETED" | "CANCELLED";
++export type OrderStatus = "PENDING" | "PAID" | "EXPIRED" | "CANCELLED";
++export type PaymentStatus = "INITIATED" | "PENDING" | "SUCCEEDED" | "FAILED" | "CANCELLED" | "REFUNDED";
+ export type SubscriptionStatus = "PENDING" | "ACTIVE" | "EXPIRED" | "CANCELLED";
+ 
++/** GET /auth/me, POST /auth/login, POST /auth/register — matches SafeUser exactly (safe-user.interface.ts). Never has a `fullName`/`isSuspended`/`telegramLinked` field: use `.name` and `.status`; Telegram *link* status (distinct from the self-reported `telegramUsername`) is fetched separately via GET /telegram/link/status. */
+ export interface SafeUser {
+   id: string;
+   email: string;
+-  fullName: string;
++  name: string;
+   phone: string | null;
++  telegramUsername: string | null;
+   role: Role;
+-  isSuspended: boolean;
+-  telegramLinked: boolean;
++  status: UserStatus;
++  locale: Locale;
++  emailVerifiedAt: string | null;
+   createdAt: string;
++  updatedAt: string;
+ }
+ 
++/** GET/POST /courses — raw Prisma Course, returned as-is by CoursesController. */
+ export interface Course {
+   id: string;
+-  title: string;
+   slug: string;
+-  track: string;
+-  summary: string;
++  title: string;
+   description: string;
+-  priceMinor: number;
+-  currency: string;
+-  durationWeeks: number;
++  track: CourseTrack;
++  monthlyPrice: number; // integer minor units
++  currency: Currency;
++  durationDays: number;
+   status: CourseStatus;
+   createdAt: string;
+   updatedAt: string;
++  // Added in the curriculum feature (Course.targetAudience/learningOutcomes
++  // + the related CourseModule/CourseTopic tables) — see lib/api/courses.ts
++  // for why these live on a separate CourseDetail type instead of here.
+ }
+ 
+-export interface CourseGroup {
++/** Extended shape returned only by the public course-detail read (GET /courses/:id) once the curriculum feature is present — see courses.service.ts's findOnePublished/findOneAdmin, which include the modules relation and the two string-array columns added directly to Course. */
++export interface CourseDetail extends Course {
++  targetAudience: string[];
++  learningOutcomes: string[];
++  modules: CourseModule[];
++}
++
++export interface CourseModule {
+   id: string;
+   courseId: string;
+   title: string;
++  description: string;
++  position: number;
++  topics: CourseTopic[];
++  createdAt: string;
++  updatedAt: string;
++}
++
++export interface CourseTopic {
++  id: string;
++  moduleId: string;
++  label: string;
++  position: number;
++  createdAt: string;
++  updatedAt: string;
++}
++
++/** GET/POST /course-groups — CourseGroupResponse (not raw Prisma: `telegramGroupId` is derived). Field is `name`, not `title`; `endDate` and `capacity` are nullable; there is no `enrolledCount` — the API does not expose remaining-seat counts today. */
++export interface CourseGroup {
++  id: string;
++  courseId: string;
++  name: string;
+   startDate: string;
+-  endDate: string;
+-  capacity: number;
+-  enrolledCount: number;
++  endDate: string | null;
++  schedule: string;
++  teacherId: string | null;
++  capacity: number | null;
+   status: CourseGroupStatus;
+   telegramGroupId: string | null;
+   createdAt: string;
++  updatedAt: string;
+ }
+ 
++/** GET/POST /orders — raw Prisma Order. `userId`, not `studentId`; `amount`, not `amountMinor`. */
+ export interface Order {
+   id: string;
+-  studentId: string;
++  orderNumber: string;
++  userId: string;
+   courseGroupId: string;
+-  amountMinor: number;
+-  currency: string;
++  subscriptionId: string | null;
++  amount: number; // integer minor units
++  currency: Currency;
+   status: OrderStatus;
+-  expiresAt: string;
++  periodStart: string;
++  periodEnd: string;
++  description: string | null;
+   createdAt: string;
++  expiresAt: string | null;
++  cancelledAt: string | null;
+ }
+ 
++/** Raw Prisma Payment — returned inside GET /payments/:orderId/status and by admin payment-history reads. There is no top-level `amount`/`currency` on Payment; those live on the parent Order (see admin-dashboard.service.ts's own comment on this). */
+ export interface Payment {
+   id: string;
+   orderId: string;
+-  provider: string;
+-  providerReference: string | null;
+-  amountMinor: number;
+-  currency: string;
+-  status: "PENDING" | "SUCCEEDED" | "FAILED";
+-  createdAt: string;
++  provider: "ARCA";
++  providerOrderId: string;
++  status: PaymentStatus;
++  attemptNumber: number;
++  approvalCode: string | null;
++  rrn: string | null;
++  cardMask: string | null;
++  cardBrand: string | null;
++  failureCode: string | null;
++  failureMessage: string | null;
++  initiatedAt: string;
++  completedAt: string | null;
+ }
+ 
++/** GET /subscriptions/me, etc. — SubscriptionResponse. `startDate`/`expireDate`, not `startedAt`/`expiresAt`. `courseId`/`courseGroupId` ARE present here (derived server-side from the Enrollment relation), unlike on Order. */
+ export interface Subscription {
+   id: string;
+   studentId: string;
+-  courseId: string;
+   courseGroupId: string;
++  courseId: string;
+   status: SubscriptionStatus;
+-  startedAt: string | null;
+-  expiresAt: string | null;
++  startDate: string | null;
++  expireDate: string | null;
++  autoRenew: boolean;
++  cancelledAt: string | null;
+   createdAt: string;
+-  // Enriched client-side via lookups against /courses and /course-groups
++  updatedAt: string;
++  // Enriched client-side via lookups against /courses and /course-groups —
++  // see DashboardContent's `load()`.
+   courseTitle?: string;
+-  courseGroupTitle?: string;
++  courseGroupName?: string;
++}
++
++/** GET /admin/dashboard — dashboard-stats.interface.ts exactly. Revenue is per-currency (never summed across AMD/USD), and there is no single "pending orders" figure exposed today. */
++export interface RevenueByCurrency {
++  currency: Currency;
++  amount: number;
++}
++
++export interface PopularCourse {
++  courseId: string;
++  title: string;
++  enrollmentCount: number;
+ }
+ 
+ export interface DashboardStats {
+   totalStudents: number;
+   activeSubscriptions: number;
+-  pendingOrders: number;
+-  revenueMinorThisMonth: number;
+-  currency: string;
++  expiredSubscriptions: number;
++  monthlyRevenue: RevenueByCurrency[];
++  popularCourses: PopularCourse[];
+ }
+ 
++/** Every paginated list endpoint in this API returns this exact envelope (see common/interfaces/paginated-result.interface.ts) — `data`/`meta`, never `items`/`total`/`pageSize`. */
+ export interface PaginatedResult<T> {
+-  items: T[];
+-  total: number;
+-  page: number;
+-  pageSize: number;
++  data: T[];
++  meta: {
++    page: number;
++    limit: number;
++    total: number;
++    totalPages: number;
++  };
+ }
+ 
+ export interface ApiErrorBody {
+diff --git a/Frontend/praxis-web/next.config.ts b/Frontend/praxis-web/next.config.ts
+index 0f46554f..9f565a7e 100644
+--- a/Frontend/praxis-web/next.config.ts
++++ b/Frontend/praxis-web/next.config.ts
+@@ -7,6 +7,7 @@ const nextConfig: NextConfig = {
+   // only because client components (PurchaseButton, AuthContext) also need it.
+   env: {
+     NEXT_PUBLIC_API_URL: process.env.NEXT_PUBLIC_API_URL,
++    NEXT_PUBLIC_TELEGRAM_CONTACT_USERNAME: process.env.NEXT_PUBLIC_TELEGRAM_CONTACT_USERNAME,
+   },
+ };
+ 

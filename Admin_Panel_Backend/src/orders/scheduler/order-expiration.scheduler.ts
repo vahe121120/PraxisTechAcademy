@@ -25,7 +25,7 @@ export class OrderExpirationScheduler {
 
   constructor(private readonly ordersService: OrdersService) {}
 
-  @Cron(CronExpression.EVERY_15_MINUTES, {
+  @Cron(CronExpression.EVERY_5_MINUTES, {
     name: 'order-expiration-check',
     timeZone: 'Asia/Yerevan',
   })
