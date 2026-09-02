@@ -87,7 +87,7 @@ export class CoursesController {
 
   @Public()
   @Get(':id')
-  findOnePublished(@Param('id', ParseUUIDPipe) id: string): Promise<Course> {
+  findOnePublished(@Param('id') id: string): Promise<Course> {
     return this.coursesService.findOnePublished(id);
   }
 }

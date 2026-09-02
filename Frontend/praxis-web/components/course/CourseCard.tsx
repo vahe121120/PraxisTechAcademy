@@ -6,27 +6,48 @@ import { formatMoney } from "@/lib/money";
 import type { Course } from "@/lib/types";
 
 export function CourseCard({ course }: { course: Course }) {
+  const href = `/courses/${course.slug || course.id}`;
+
   return (
-    <Link href={`/courses/${course.id}`} className="group block">
-      <Card className="h-full transition-shadow group-hover:shadow-md">
-        <CardBody className="flex h-full flex-col gap-3">
-          <div className="flex items-start justify-between gap-2">
-            <Badge tone="brand">{course.track}</Badge>
-            <ArrowUpRight
-              className="h-4 w-4 text-ink-300 transition-colors group-hover:text-brand-500"
-              aria-hidden="true"
-            />
+    <Link href={href} className="group block focus-visible:outline-none">
+      <Card className="h-full transition-all duration-200 group-hover:-translate-y-0.5 group-hover:border-brand-300 group-hover:shadow-md">
+        <CardBody className="flex h-full flex-col justify-between gap-4 p-5">
+          <div className="flex flex-col gap-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <Badge tone="brand">{course.track}</Badge>
+                {course.level && (
+                  <span className="rounded-full bg-ink-50 px-2 py-0.5 text-xs font-medium text-ink-500">
+                    {course.level}
+                  </span>
+                )}
+              </div>
+              <ArrowUpRight
+                className="h-4 w-4 text-ink-300 transition-colors group-hover:text-brand-600"
+                aria-hidden="true"
+              />
+            </div>
+
+            <h3 className="text-lg font-semibold text-ink-900-solid group-hover:text-brand-700 transition-colors">
+              {course.title}
+            </h3>
+
+            <p className="line-clamp-2 text-sm text-ink-500">
+              {course.shortDescription || (course.description ? course.description.split("\n")[0] : "")}
+            </p>
           </div>
-          <h3 className="text-lg font-semibold text-ink-900-solid">{course.title}</h3>
-          <p className="line-clamp-2 flex-1 text-sm text-ink-500">{course.description}</p>
-          <div className="flex items-center justify-between border-t border-ink-100 pt-3">
-            <span className="flex items-center gap-1.5 text-sm text-ink-500">
+
+          <div className="flex items-center justify-between border-t border-ink-100 pt-3 text-sm">
+            <span className="flex items-center gap-1.5 text-ink-500">
               <Clock className="h-4 w-4" aria-hidden="true" />
               {course.durationDays} days
             </span>
-            <span className="font-semibold text-ink-900-solid">
-              {formatMoney(course.monthlyPrice, course.currency)}
-            </span>
+            <div className="text-right">
+              <span className="font-semibold text-ink-900-solid">
+                {formatMoney(course.monthlyPrice, course.currency)}
+              </span>
+              <span className="text-xs text-ink-500"> / mo</span>
+            </div>
           </div>
         </CardBody>
       </Card>

@@ -48,7 +48,21 @@ export interface SafeUser {
   updatedAt: string;
 }
 
-// Raw Prisma `Course` row, as returned unmapped by CoursesController.
+export interface CourseModuleItem {
+  id?: string;
+  title: string;
+  description: string;
+  topics: string[];
+}
+
+export interface CourseProjectItem {
+  title: string;
+  description: string;
+  tech?: string[];
+}
+
+// Raw Prisma `Course` row, as returned unmapped by CoursesController,
+// extended with optional rich curriculum / marketing fields.
 export interface Course {
   id: string;
   slug: string;
@@ -61,6 +75,19 @@ export interface Course {
   status: CourseStatus;
   createdAt: string;
   updatedAt: string;
+
+  // Optional rich metadata & curriculum
+  shortDescription?: string;
+  level?: "Beginner" | "Intermediate" | "Advanced" | string;
+  format?: string;
+  language?: string;
+  schedule?: string;
+  certificate?: boolean | string;
+  prerequisites?: string[];
+  learningOutcomes?: string[];
+  targetAudience?: string[];
+  projects?: CourseProjectItem[];
+  modules?: CourseModuleItem[];
 }
 
 // See Admin_Panel_Backend/src/course-groups/interfaces/course-group-response.interface.ts

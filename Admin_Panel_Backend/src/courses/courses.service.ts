@@ -41,9 +41,16 @@ export class CoursesService {
    * signal; "not found" is both more honest from the client's perspective
    * and doesn't leak the catalog's unpublished contents.
    */
-  async findOnePublished(id: string): Promise<Course> {
+  async findOnePublished(idOrSlug: string): Promise<Course> {
+    const isUuid =
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        idOrSlug,
+      );
+
     const course = await this.prisma.course.findFirst({
-      where: { id, status: CourseStatus.PUBLISHED },
+      where: isUuid
+        ? { id: idOrSlug, status: CourseStatus.PUBLISHED }
+        : { slug: idOrSlug, status: CourseStatus.PUBLISHED },
     });
 
     if (!course) {
